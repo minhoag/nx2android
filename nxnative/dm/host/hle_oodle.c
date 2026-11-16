@@ -158,6 +158,9 @@ void dm_oodle_job_maybe(void) {
     uint32_t hdr[2] = {0x524f4d44, n}; fwrite(hdr, 4, 2, out);
     size_t scratch_n = 16u << 20; void *scratch = malloc(scratch_n);   // the decoder's work memory, so Oodle never calls its allocator
     uint32_t bad = 0; uint64_t raw_total = 0; const char *bo = getenv("DM_OODLE_JOB_BNSH"); int bnsh_only = bo && atoi(bo);
+    const char *nh = getenv("DM_OODLE_JOB_NEEDLE"); uint8_t needle[128]; size_t needle_n = nh ? strlen(nh) / 2 : 0;
+    if (nh && (strlen(nh) % 2 || needle_n > sizeof needle)) die("DM_OODLE_JOB_NEEDLE: expected at most 256 hex digits");
+    for (size_t i = 0; i < needle_n; i++) { char h[3] = {nh[i * 2], nh[i * 2 + 1], 0}; needle[i] = (uint8_t)strtoul(h, NULL, 16); }
     for (uint32_t i = 0; i < n; i++) {
         uint32_t cl = rd32(in), rl = rd32(in);
         uint8_t *c = malloc(cl ? cl : 1), *r = malloc(rl ? rl : 1);
@@ -165,9 +168,8 @@ void dm_oodle_job_maybe(void) {
         int64_t got = dec_run(c, cl, r, rl, scratch, (int64_t)scratch_n);
         uint32_t ol = got == (int64_t)rl ? rl : 0;
         if (!ol && rl && bad++ < 8) LOG("[RED] DM_OODLE_JOB: record %u (%u → %u bytes) failed (decoder returned %lld)", i, cl, rl, (long long)got);
-        // DM_OODLE_JOB_BNSH=1: a record that holds no BNSH shader file is written as length 0xffffffff and no bytes (the porter decodes Pokémon Legends: Arceus's GFPAK entries
-        // on the Android device, 3 GB decoded, of which only the shader entries come back)
-        if (ol && bnsh_only && !memmem(r, ol, "BNSH", 4)) { uint32_t none = 0xffffffffu; fwrite(&none, 4, 1, out); free(c); free(r); continue; }
+        // DM_OODLE_JOB_BNSH=1 keeps BNSH entries; DM_OODLE_JOB_NEEDLE also keeps a matching entry (Scarlet's Lua script).
+        if (ol && bnsh_only && !memmem(r, ol, "BNSH", 4) && !(needle_n && memmem(r, ol, needle, needle_n))) { uint32_t none = 0xffffffffu; fwrite(&none, 4, 1, out); free(c); free(r); continue; }
         fwrite(&ol, 4, 1, out); if (ol) fwrite(r, 1, ol, out);
         raw_total += ol; free(c); free(r);
     }

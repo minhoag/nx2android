@@ -485,6 +485,11 @@ class Port:
         PROG.set(step="the game's Oodle entries in a job file")
         tmp = self.work / 'tmp/oodle'; nsp.rmtree(tmp); tmp.mkdir(parents=True)
         recs, job = [], tmp / 'job.bin'   # recs: (label, archive size, entry index) of each record, in order; a Trinity file's index is (pack offset, index in the pack)
+        scarlet = None
+        if self.g.id == '0100A3D008C5C000' and self.pkg_ver == 'v786432':
+            spec = importlib.util.spec_from_file_location('scarlet_held_item', NXNATIVE / 'dm/games/0100A3D008C5C000/held_item_fix.py')
+            scarlet = importlib.util.module_from_spec(spec); spec.loader.exec_module(scarlet)
+        needle = scarlet.NEEDLE if scarlet else None
         with open(job, 'wb') as jf:
             jf.write(b'DMOJ' + struct.pack('<I', 0))
             for v in self.versions:
@@ -505,7 +510,7 @@ class Port:
                                 if comp == 3: jf.write(struct.pack('<II', sz, n)); jf.write(d[st:st + sz]); recs.append((label, len(d), (off, k)))
             jf.seek(4); jf.write(struct.pack('<I', len(recs)))
         PROG.set(step=f"the game's Oodle decoder on the device: {len(recs):,} entries, {job.stat().st_size / 2**30:.1f} GB")
-        self.device_oodle_job(job, tmp / 'job.out', bnsh=True)
+        self.device_oodle_job(job, tmp / 'job.out', bnsh=True, needle=needle)
         # Index result ranges, not their payloads: read_bytes + entry slices + joins held several copies of the decoded shaders in RAM.
         # Check every record before writing a decoded archive; a short last payload used to be silently accepted by a bytes slice.
         by = {}   # label → (archive size, {index: (offset in job.out, length)})
@@ -522,7 +527,16 @@ class Port:
                 if n == 0: raise BuildError(f"the game's Oodle decoder on the device failed on {label} entry {i}")
                 off = result.tell()
                 if n > total - off: raise BuildError(f"the game's Oodle decoder on the device returned a truncated result for {label} entry {i}")
-                ent[i] = (off, n); result.seek(n, os.SEEK_CUR)
+                if needle:
+                    result.seek(off)
+                    if result.read(4) != b'BNSH':
+                        result.seek(off); raw = result.read(n)
+                        if needle in raw:
+                            try: fixed = scarlet.held_item_fix(raw)
+                            except ValueError as e: raise BuildError(str(e)) from e
+                            out = self.aw / 'scarlet-held-item-main.blua'; out.write_bytes(fixed)
+                            self.scarlet_held_item = out
+                ent[i] = (off, n); result.seek(off + n)
             dec = tmp / 'decoded'; dec.mkdir()
             for label, (size, ent) in by.items():
                 trpfs = label.endswith('.trpfs')
@@ -536,10 +550,12 @@ class Port:
                             if not chunk: raise BuildError(f"the game's Oodle decoder on the device returned a truncated result for {label} entry {i}")
                             out.write(chunk); n -= len(chunk)
         nsp.rmtree(tmp / 'job.out')
+        if needle and not getattr(self, 'scarlet_held_item', None):
+            raise BuildError('Scarlet 4.0.0 held-item script was not found in the decoded Trinity packs')
         say(f"shaders in Oodle-compressed archives ({self.oodle_why}): {len(recs):,} entries decoded by the game's own decoder on the device, "
             f"{sum(len(e) for _, e in by.values()):,} of them hold shaders")
         return {'DM_GFPAK_DECODED': str(dec)}
-    def device_oodle_job(self, job, out, bnsh=False):
+    def device_oodle_job(self, job, out, bnsh=False, needle=None):
         """One Oodle job file (hle_oodle.c: "DMOJ" records) decoded on the device into out ("DMOR"); the job file is removed. The host as an executable and the rewritten modules
         go to the device once a port (device_oodle_end removes them). bnsh: only the entries that hold a BNSH shader come back (DM_OODLE_JOB_BNSH)"""
         adb = getattr(self, 'oodle_adb', None)
@@ -554,7 +570,8 @@ class Port:
             self.oodle_adb = adb
         adb.push_file(job, f'{self.ODEV}/job.bin'); nsp.rmtree(job)
         # (the device's timeout ends the decoder before adb gives up, so no decoder is left running and holding memory on the device)
-        r = adb.shell(f'chmod 755 {self.ODEV}/dmhost; cd {self.ODEV} && rm -f job.bin.out && DM_OODLE_JOB={self.ODEV}/job.bin{" DM_OODLE_JOB_BNSH=1" if bnsh else ""} timeout 3300 ./dmhost mods '
+        job_env = f' DM_OODLE_JOB_NEEDLE={needle.hex()}' if needle else ''
+        r = adb.shell(f'chmod 755 {self.ODEV}/dmhost; cd {self.ODEV} && rm -f job.bin.out && DM_OODLE_JOB={self.ODEV}/job.bin{" DM_OODLE_JOB_BNSH=1" if bnsh else ""}{job_env} timeout 3300 ./dmhost mods '
                       f'> job.log 2>&1; echo "exit $?"; grep -a -e DM_OODLE_JOB -e RED job.log | tail -5', timeout=3600)
         (self.logs / 'android_oodle_job.log').write_text(r, encoding='utf-8')
         if 'exit 0' not in r: raise BuildError(f"the game's Oodle decoder on the device failed (see {self.logs / 'android_oodle_job.log'})")
@@ -846,7 +863,8 @@ class Port:
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=romfs, shaders=self.dmsv,
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + zenv + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
                              + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None),
+                             files={**self.fps_files, **font_files}, romfs_overrides={'script/lua/bin/release/main/main.blua': self.scarlet_held_item} if getattr(self, 'scarlet_held_item', None) else {},
+                              profile_h=getattr(self, 'profile_h', None),
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')

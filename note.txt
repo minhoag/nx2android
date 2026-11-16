@@ -1,0 +1,21 @@
+What this change does:
+It tries to extract and patch Scarlet’s held-item script during shader decoding, then add the patched file to the data pack. Other games do not load the helper, but you’re right: Scarlet-specific decisions still remain in the shared pipeline.
+Must fix
+1. The archive extraction cannot produce the expected source (porter/pipeline.py:530–539)
+- What this is: The patch requires one decoded entry to match the complete original script.
+- Problem: I inspected Scarlet’s archive: none of its entries has the original script’s size. The current extraction therefore cannot satisfy the source-hash check.
+- Fix: Identify and extract the actual script representation before applying the patch.
+- If skipped: A fresh port fails instead of producing the fix. My earlier completion claim was premature.
+2. Rebuilding can silently omit the fix (porter/pipeline.py:696–698,866)
+- What this is: The override is registered only inside the Oodle callback.
+- Problem: Cached shader builds skip that callback. A new Porter run then rebuilds the data pack without the override—even if the patched file exists on disk.
+- Fix: Prepare and validate RomFS patches independently of shader-cache reuse.
+- If skipped: The held-item crash can return after rebuilding.
+Should fix
+3. Scarlet knowledge still lives in shared code (porter/pipeline.py:488–492,536–553,866)
+- What this is: The pipeline contains Scarlet’s ID, version, helper path, output filename and override destination.
+- Problem: Moving the helper did not fully isolate the game-specific behavior. Also, tests/arch_rules.py:57 rejects profile Python files other than patches.py.
+- Fix: Keep Scarlet’s selection rules and patch description in its profile; let shared code consume a generic, profile-declared RomFS patch only when needed. Prefer declarative data over another dynamically imported helper.
+- If skipped: Every similar game fix requires editing the shared pipeline again, and the new helper violates the existing profile rules.
+Verdict: fix 1–3 before shipping. No code changed during this review.
+Not checked: Full device port or tests; archive metadata and cache behavior were inspected directly.
