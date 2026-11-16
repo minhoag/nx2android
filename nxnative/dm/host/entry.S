@@ -119,6 +119,20 @@ _dm_gate:
     add sp, sp, #800
     ret
 
+// Invoke an offline inline-hook callback with the guest's flags and register context.
+    .globl _dm_compat_inline_call
+    .p2align 2
+_dm_compat_inline_call:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    mov x16, x0
+    mov x0, x1
+    msr nzcv, x2
+    blr x16
+    mrs x0, nzcv
+    ldp x29, x30, [sp], #16
+    ret
+
 // 3) dm_thread_enter(entry, arg, sp): guest thread start. Switch to the guest stack given by the SDK and call entry with x0 = argument;
 //    Horizon threads must exit via ExitThread; returning from entry is reported as an error.
     .globl _dm_thread_enter
