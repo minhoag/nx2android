@@ -46,6 +46,7 @@ class Options:
     firmware: Path = None              # the player's system content files (.nca), for the profile's sysdata titles (extract_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
     touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
+    no_menu_button: bool = False       # no on-screen menu button: DM_MENU_BUTTON=0 in env.txt (dm/android/front_android.c g_menu_btn); Back opens the menu (issue #397)
     native_keyboard: bool = False      # optional Unicode Android IME (requires SDK/JDK)
     external_display: bool = False     # compile the optional external-screen activity with the Android SDK
     vercode_offset: int = 0            # added to the APK's versionCode: a rebuild of the same game version installs over a build with a higher one (version_code)
@@ -78,13 +79,13 @@ def app_stem(g, name):   # the file name of the APK and the data pack: the profi
 TOUCH_SETTINGS = {'overlay': '0'}
 
 MIIMODEL_TITLE = 0x0100000000000802
-FONT_TITLES = (0x0100000000000811, 0x0100000000000810)   # FontStandard, FontNintendoExtension: the host's shared fonts (hle_sdk16.c font_sysdata)
+FONT_TITLES = (0x0100000000000811, 0x0100000000000810, 0x0100000000000814, 0x0100000000000813, 0x0100000000000812)   # FontStandard, FontNintendoExtension, FontChineseSimplified, FontChineseTraditional, FontKorean (hle_sdk16.c font_get)
 def sysdata_no_firmware(name, ids):   # the one [RED] line for a profile whose system data is not given (--firmware): what the host draws in its place
     text = f'{name} reads system data from the console\'s firmware ({", ".join(f"{t:016x}" for t in ids)}); without --firmware <your firmware dump\'s system content folder> the host\'s stand-in is used'
     if MIIMODEL_TITLE in ids: text += ' and those parts draw nothing (MiiModel: the Mii heads)'
     fonts = [t for t in ids if t in FONT_TITLES]
     if fonts: text += (f'; without the console\'s shared fonts ({", ".join(f"{t:016x}" for t in fonts)}) the host draws with its stand-ins (Android\'s own font and the generated button icons), '
-                       'and a game that needs a glyph they lack can fail at start: --shared-font <ttf> is the other way (the standard font)')
+                       'and a game that needs a glyph they lack can fail at start: --shared-font <ttf> is the other way (every shared font but the button icons)')
     return text
 
 VERCODE_OFFSET_MAX = 65535   # Switch versions are 65536 apart (v65536, v131072): a rebuild of one, offset by this much at most, stays below the next one's port
@@ -862,6 +863,7 @@ class Port:
             romfs, zenv = self.aw / 'romfs_zstd' / self.pkg_ver, ['DM_ROMFS_ZSTD=1']
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=romfs, shaders=self.dmsv,
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + zenv + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
+                             + (['DM_MENU_BUTTON=0'] if self.o.no_menu_button else [])
                              + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
                              files={**self.fps_files, **font_files}, romfs_overrides={'script/lua/bin/release/main/main.blua': self.scarlet_held_item} if getattr(self, 'scarlet_held_item', None) else {},
                               profile_h=getattr(self, 'profile_h', None),

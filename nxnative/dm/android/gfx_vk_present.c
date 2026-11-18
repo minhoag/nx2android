@@ -665,7 +665,7 @@ static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
             }
         }
     }
-    for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU && mode) {   // the menu button, on top of the controls, where the player put it
+    for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU && mode && !ov_off(&OV_CTLS[i])) {   // the menu button, on top of the controls, where the player put it (not with DM_MENU_BUTTON=0)
         float ma = mode == 1 && (menu < 0 || edit) ? fmaxf(op, 0.5f) : OV_MENU_ALPHA;   // (findable at any opacity)
         if (th) { if (!tbound) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.layout, 0, 1, &g_tt[g_ov.lay].set, 0, NULL); tbound = 1; }
                   ov_theme_menu(cb, th, i, ma); continue; }
@@ -922,7 +922,8 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
     extern pthread_mutex_t g_vk_queue_mu;
     pthread_mutex_lock(&g_vk_queue_mu);
-    if (vkQueueSubmit(V.q, 1, &si, g_pfence[k])) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed"); return; }
+    r = vkQueueSubmit(V.q, 1, &si, g_pfence[k]);
+    if (r) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed (%d)", r); return; }
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &g_done_sem[k], 1, &g_swap, &idx, NULL};
     VkPresentTimeGOOGLE ptm = {++g_pace_id, period >= 0 ? pace_desired(period) : 0};
     VkPresentTimesInfoGOOGLE pti = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, NULL, 1, &ptm};
