@@ -11,6 +11,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import csrc  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 APK = ROOT / 'nxnative/dm/android/apk'
 ANDROID = ROOT / 'nxnative/dm/android'
@@ -85,8 +88,8 @@ class GameMode(unittest.TestCase):
         cc = shutil.which('cc') or shutil.which('clang')
         if not cc: self.skipTest('C compiler required')
         with tempfile.TemporaryDirectory(prefix='nx2a_game_mode_') as temp:
-            c = Path(temp) / 'test.c'; exe = Path(temp) / 'test'; c.write_text(source, encoding='utf-8')
-            result = subprocess.run([cc, '-std=c11', '-D_POSIX_C_SOURCE=200809L', *['-I' + str(x) for x in includes], str(c), '-o', str(exe)], capture_output=True, text=True)
+            c = Path(temp) / 'test.c'; exe = Path(temp) / 'test'; c.write_text(source, encoding='utf-8'); csrc.pacing_files(temp)   # perf_android.c asks dm_pacing.c
+            result = subprocess.run([cc, '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-I' + temp, *['-I' + str(x) for x in includes], str(c), '-o', str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             result = subprocess.run([str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -139,13 +142,16 @@ class GameMode(unittest.TestCase):
             with self.subTest(gl=gl), tempfile.TemporaryDirectory(prefix='nx2a_game_pipeline_') as temp:
                 t = Path(temp); p = object.__new__(pipeline.Port)
                 p.g = SimpleNamespace(); p.app_name = 'Synthetic'; p.pkg_ver = 'v0'; p.package = 'org.nx2a.probe'; p.display = '1.0'
-                p.o = SimpleNamespace(out=t, vercode_offset=0, external_display=False, native_keyboard=False, vulkan_driver=None, debug=True)
-                p.ap = SimpleNamespace(landscape=False); p.so = t/'host.so'; p.logs = t; p.env = {}; p.result = {}
+                p.o = SimpleNamespace(out=t, vercode_offset=0, external_display=False, external_runtime=False, native_keyboard=False, vulkan_driver=None, debug=True)
+                p.ap = SimpleNamespace(landscape=False, id='010015100B514000'); p.so = t/'host.so'; p.logs = t; p.env = {}; p.result = {}
+                p.aw = t; p.patched = t/'patched'; p.dmsv = t/'shaders.dmsv'; p.fps_files = {}; p.profile_h = '0' * 64
                 p.icon = p.theme = p.ui_font = lambda: []
+                p.external_activity = lambda: ['--dex', t/'classes.dex']
+                p.button_font = lambda: ([], {})
                 if gl is not None: p.gl = gl
                 calls = []
                 def run(args, *a, **kw): calls.append(args); p.apk_path.write_bytes(b'unsigned placeholder')
-                with patch.object(pipeline, 'app_stem', return_value='Synthetic'), patch.object(pipeline.nsp, 'run', side_effect=run), patch.object(pipeline.paths, 'signing_key', return_value=t/'unused-key'), patch.object(pipeline, 'PROG'):
+                with patch.object(pipeline, 'app_stem', return_value='Synthetic'), patch.object(pipeline.nsp, 'run', side_effect=run), patch.object(pipeline.paths, 'signing_key', return_value=t/'unused-key'), patch.object(pipeline, 'PROG'), patch.object(pipeline.runtimebundle, 'build', return_value=({}, '0' * 64, ['--asset', f'runtime/manifest.json={t}/manifest.json'])):
                     p.apk()
                 self.assertEqual(len(calls), 1)
                 self.assertEqual('--game-mode-performance' in calls[0], gl is False)
@@ -158,6 +164,7 @@ class GameMode(unittest.TestCase):
         code = source[start:end]
         code += '\nstatic int64_t g_frame_cost; static unsigned g_held_back;\nstatic int shown_late(void) { return -1; }\n'
         code += function(source, 'adapt_frame')
+        code = csrc.PACING_INCLUDE + code
         self.compile_run('''#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -236,6 +243,7 @@ int main(void) {
                             'int dm_fps_ceiling(void) { return PROFILE_CEILING; }')
         code += '\nstatic int64_t g_frame_cost; static unsigned g_held_back;\nstatic int shown_late(void) { return -1; }\n'
         code += function(source, 'adapt_frame')
+        code = csrc.PACING_INCLUDE + code
         for ceiling in (0, 30):
             with self.subTest(ceiling=ceiling):
                 self.compile_run(f'#define PROFILE_CEILING {ceiling}\n' + r'''#include <assert.h>
@@ -281,6 +289,7 @@ int main(void) {
                                 'int dm_fps_ceiling(void) { return PROFILE_CEILING; }')
         fixture = (ROOT/'tests/game_mode_hint_fixture.c').read_text(encoding='utf-8')
         code = policy + '\n' + function(source, 'hint_report') + '\n' + function(source, 'dm_perf_frame')
+        code = csrc.PACING_INCLUDE + code
         for ceiling in (0, 30):
             with self.subTest(ceiling=ceiling):
                 self.compile_run(f'#define PROFILE_CEILING {ceiling}\n' + fixture.replace('/* PRODUCTION */', code))

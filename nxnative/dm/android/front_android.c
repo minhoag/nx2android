@@ -3,13 +3,15 @@
 //   libdmhost.so in the app (a NativeActivity, no Java): ANativeActivity_onCreate lays out the game's files in the app's external files folder
 //   (/sdcard/Android/data/<package>/files: mods/ = the rewritten modules, RomFS/ (or env.txt's DM_ROMFS: romfs_readable), shaders.dmsv; env.txt = KEY=VALUE switches; log.txt = the log), keeps saves in
 //   internal storage, and starts the host on a thread of its own. The window goes to the Vulkan backend's swapchain (dm_front_window); game controllers
-//   (KEYCODE_BUTTON_*, sticks, triggers, hat) feed player 1's pad; touches go to the game's touch screen; shaking the device shakes player 1's controller and turning it turns
-//   the controller's six-axis sensor (the gyroscope);
+//   (KEYCODE_BUTTON_*, sticks, triggers, hat) are each a player of their own, the first one used player 1 (pad_slots.h); touches go to the game's touch screen and
+//   the touch gamepad is player 1's; shaking the device shakes player 1's controller and turning it turns the controller's six-axis sensor (the gyroscope);
 //   leaving and coming back pauses as on iOS.
 #include "dm.h"
 #include "front.h"
 #include "dm_input.h"
+#include "pad_slots.h"
 #include "overlay_layout.h"
+#include "stick_axis.h"
 #include "pixel_font.h"
 #include "saves_android.h"
 #include <math.h>
@@ -60,11 +62,15 @@ static _Atomic int g_external_active;
 static _Atomic unsigned g_external_epoch;
 static _Atomic uint64_t g_ext_buttons, g_ext_presses;
 static _Atomic int g_ext_lx, g_ext_ly, g_ext_rx, g_ext_ry, g_ext_menu;
+static _Atomic int g_running, g_bg, g_menu;
+void dm_overlay_redraw(void);
 ANativeWindow *dm_front_window(void) { pthread_mutex_lock(&g_win_mu); ANativeWindow *w = g_external_win ? g_external_win : g_win; pthread_mutex_unlock(&g_win_mu); return w; }
 static ANativeWindow *phone_window(void) { pthread_mutex_lock(&g_win_mu); ANativeWindow *w = g_win; pthread_mutex_unlock(&g_win_mu); return w; }
 int dm_external_active(void) { return atomic_load(&g_external_active); }
 __attribute__((weak)) void vk_window_lost(void) {}   // the backend lets go of the window's swapchain before the window goes
-static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = w; pthread_mutex_unlock(&g_win_mu); }
+// Pokemon Legends: Z-A: open the pause menu, switch apps, then return; redraw stops
+// because the paused game produces no new frames. Redraw the last frame/menu when its surface returns.
+static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = w; pthread_mutex_unlock(&g_win_mu); if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_overlay_redraw(); }
 static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_win_mu); g_win = NULL; pthread_mutex_unlock(&g_win_mu); vk_window_lost(); }
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *env, jclass cls, jobject surface) {
     (void)cls;
@@ -78,9 +84,16 @@ JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *en
 void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freeze_for(int reason, int on); void dm_gfx_suspend(int on);
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
+static char g_runtime[1024];
+static jclass g_runtime_class;
+static jmethodID g_runtime_prepare, g_runtime_check_data;
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
+// the menu button in play (issue #397): env.txt's DM_MENU_BUTTON=0 (porter port --no-menu-button) leaves it out, as a control the player hid (dm_overlay_hidden):
+// not drawn and not touchable, on the gamepad and over the pause menu, so its corner of the screen is the game's. Back (the system's back gesture or key) and a
+// controller's Home/Menu key open the menu (handle_event); the layout editor shows it darkened. The external screen's gamepad keeps it (externalOverlay)
+static _Atomic int g_menu_btn = 1;
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
@@ -89,11 +102,38 @@ static _Atomic int g_cust[2][2][DM_AOV_N][CUST_K], g_cust_ver, g_edit;
 static const char *const LAYOUT_NAMES[2] = {"tablet", "phone"};
 static int ctl_named(const char *n) { for (int i = 0; i < OV_N; i++) if (!strcmp(OV_LAYOUTS[0][i].name, n)) return i; return -1; }
 int dm_opmode(void); void dm_set_opmode(int m);   // hle_oe.c: 0 handheld, 1 docked; a change reaches the game as the Switch's operation mode notification
+// ---- the frame rate counter's options (overlay_layout.h fpso_*): settings.txt fps_rows (a bit a row: 1 FPS, 2 SOC, 4 BAT, 8 driver, 16 graph), fps_pos (0 top left, 1 top right,
+// 2 bottom left, 3 bottom right), fps_colour (0 white, 1 yellow, 2 green, 3 cyan, 4 magenta), fps_outline (0 box, 1 none, 2 thin, 3 medium, 4 thick), fps_size (0 small,
+// 1 normal, 2 large, 3 extra large). A value out of range is the default. g_fps_ver counts the changes (dm_menu_state: the panel is drawn again)
+static _Atomic int g_fps_opts = FPSO_DEFAULT, g_fps_ver;
+// FPS_OPTS_BEGIN
+static int fps_opt_parse(const char *line) {   // one settings.txt line: 1 when it was one of the counter's
+    int v, o = atomic_load(&g_fps_opts), r = fpso_rows(o), p = fpso_pos(o), c = fpso_colour(o), l = fpso_outline(o), z = fpso_size(o);
+    if (sscanf(line, "fps_rows=%d", &v) == 1) r = v >= 0 && v <= FPSO_ALL ? v : FPSO_ROWS_DEFAULT;
+    else if (sscanf(line, "fps_pos=%d", &v) == 1) p = v >= 0 && v < FPSO_POS_N ? v : FPSO_TL;
+    else if (sscanf(line, "fps_colour=%d", &v) == 1) c = v >= 0 && v < FPSO_COLOUR_N ? v : FPSO_WHITE;
+    else if (sscanf(line, "fps_outline=%d", &v) == 1) l = v >= 0 && v < FPSO_OUTLINE_N ? v : FPSO_BOX;
+    else if (sscanf(line, "fps_size=%d", &v) == 1) z = v >= 0 && v < FPSO_SIZE_N ? v : FPSO_NORMAL;
+    else return 0;
+    atomic_store(&g_fps_opts, fpso_pack(r, p, c, l, z)); return 1;
+}
+static void fps_opt_write(FILE *f) {   // (all five keys: a file without them is the default)
+    int o = atomic_load(&g_fps_opts);
+    fprintf(f, "fps_rows=%d\nfps_pos=%d\nfps_colour=%d\nfps_outline=%d\nfps_size=%d\n", fpso_rows(o), fpso_pos(o), fpso_colour(o), fpso_outline(o), fpso_size(o));
+}
+static int fps_opt_press(int item) {   // a menu item of the Counter or Style tab: 1 when it changed an option
+    int o = atomic_load(&g_fps_opts), n = fpso_step(o, item);
+    if (n == o) return 0;
+    atomic_store(&g_fps_opts, n); atomic_fetch_add(&g_fps_ver, 1); return 1;
+}
+// FPS_OPTS_END
+int dm_fps_opts(void) { return atomic_load(&g_fps_opts); }   // gfx_vk_present.c: the counter's options, packed (fpso_*)
 static void settings_load(void) {
     char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
     if (!f) return;
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
+        else if (fps_opt_parse(line)) {}
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
@@ -116,6 +156,7 @@ static void settings_save(void) {
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
+    fps_opt_write(f);
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
@@ -129,7 +170,6 @@ void dm_haptics_suspend(unsigned reason, int suspended);
 __attribute__((weak)) void dm_overlay_redraw(void) {}   // the backend presents the last frame again (the pause menu changed while the game is held)
 
 // ---- holding the game: in the background and while the pause menu is open. Its clock reads wait (reason 1) and its audio goes to the silent sink ----
-static _Atomic int g_running, g_bg, g_menu;
 static pthread_mutex_t g_hold_mu = PTHREAD_MUTEX_INITIALIZER; static int g_held;
 static _Atomic int g_ime_on;
 static _Atomic int g_tx_on;   // text entry open (front_text_input): the game is held as by the menu
@@ -142,7 +182,7 @@ static void hold_sync(void) {
 static void shake_sensor(int on);   // the accelerometer, off in the background (input, below)
 static void go_background(void) { if (!atomic_load(&g_running) || atomic_exchange(&g_bg, 1)) return; dm_focus_set(2); dm_focus_set(3);   // through OutOfFocus, as a game sees HOME and then the suspension (front_mac.m does the same)
     hold_sync(); dm_gfx_suspend(1); shake_sensor(0); }
-static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); }
+static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); dm_overlay_redraw(); }
 void dm_perf_gpu_release(void);   // perf_android.c: the GPU's clock control back to its governor (DM_GPU_TURBO)
 // The clock control goes back after go_background: its dm_gfx_suspend waits for the presents in progress, and one of them could otherwise set the GPU's power control again
 static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu_release(); }
@@ -152,7 +192,7 @@ static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu
 static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
-static int g_quit;
+static _Atomic int g_quit;
 static void act_finish(ANativeActivity *a) {
     JNIEnv *E = a->env; jclass c = (*E)->GetObjectClass(E, a->clazz); jmethodID m = c ? (*E)->GetMethodID(E, c, "finish", "()V") : NULL;
     if (m) (*E)->CallVoidMethod(E, a->clazz, m);
@@ -240,7 +280,40 @@ JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalInput(JNIEnv *env,
     if (menu) atomic_fetch_add(&g_ext_menu, 1);
     if (g_ilooper) ALooper_wake(g_ilooper);
 }
-static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly rx ry lt rt hatx haty
+// Each controller is a player of its own, as on the Mac (front_mac.m): it takes a slot (pad_slots.h) the first time it sends input that counts (a mapped key, or
+// an axis past its dead zone or threshold: a device that says it is a gamepad and sends nothing or only idle reports takes none, issues #22 and #210), player 1
+// first. Only a controller as pad_watch counts one takes a slot (not virtual, a gamepad or a joystick); every other device's input (a keyboard's or a remote's keys,
+// `adb shell input`) is player 1's, as before. A controller that comes back gets its player back by its InputDevice descriptor (read at its first input, pad_key_now,
+// as a DualSense sends input before pad_watch sees it), also when it comes back under a new id before pad_watch's next poll freed the old one, and pad_watch frees
+// the slot when the device goes. The touch gamepad, shaking and the game's rumble stay player 1's. DM_PAD_MERGE=1: every controller is player 1, as before
+static uint64_t g_btn[DM_PLAYERS]; static float g_ax[DM_PLAYERS][8]; static int g_pad_used;   // per player: lx ly rx ry lt rt hatx haty
+static pad_slots g_slots; static int g_pad_merge = -1;
+static struct { int id; char key[64]; } g_dev_key[16]; static int g_ndev_key;   // each controller's descriptor (its name when it has none), from pad_watch
+static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // the slots, the keys and the per-player state: the input thread and pad_watch
+static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
+static JavaVM *g_vm; static jclass g_in_cls; static jmethodID g_in_get, g_in_desc, g_in_name, g_in_src, g_in_virt;   // InputDevice for the input thread (input_thread attaches it)
+static void pad_key_now(int id, char *out, size_t n) {   // input thread: a controller's descriptor (its name when it has none) before pad_watch learns it; "" when unknown
+    JNIEnv *E = NULL; out[0] = 0;
+    if (!g_vm || !g_in_cls || (*g_vm)->GetEnv(g_vm, (void **)&E, JNI_VERSION_1_6) != JNI_OK) return;
+    jobject d = (*E)->CallStaticObjectMethod(E, g_in_cls, g_in_get, id); if (jx(E) || !d) return;
+    jmethodID m[2] = { g_in_desc, g_in_name };
+    for (int k = 0; k < 2 && !out[0]; k++) {
+        jstring s = m[k] ? (*E)->CallObjectMethod(E, d, m[k]) : NULL; const char *c = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
+        if (c) { snprintf(out, n, "%s", c); (*E)->ReleaseStringUTFChars(E, s, c); }
+        if (s) (*E)->DeleteLocalRef(E, s);
+    }
+    (*E)->DeleteLocalRef(E, d);
+}
+// input thread: a device by pad_watch's test. 1: a controller (not virtual, a gamepad or a joystick); 0: not one; -1: gone (InputDevice.getDevice gives null);
+// -2: unknown (Java cannot be asked on this thread)
+static int pad_dev_kind(int id) {
+    JNIEnv *E = NULL;
+    if (!g_vm || !g_in_cls || !g_in_src || !g_in_virt || (*g_vm)->GetEnv(g_vm, (void **)&E, JNI_VERSION_1_6) != JNI_OK) return -2;
+    jobject d = (*E)->CallStaticObjectMethod(E, g_in_cls, g_in_get, id); if (jx(E)) return -2; if (!d) return -1;
+    jint src = (*E)->CallIntMethod(E, d, g_in_src); jboolean virt = (*E)->CallBooleanMethod(E, d, g_in_virt); int bad = jx(E);
+    (*E)->DeleteLocalRef(E, d);
+    return bad ? -2 : !virt && ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK);
+}
 // A physical controller's face buttons by their label (an Xbox controller's A is the game's A) instead of by their position: the game's own prompts name the button
 // (A to confirm, B to go back), which an Xbox controller's labels match and its positions do not. Label or position is a property of the player's controller, not of
 // the game, so it is the pause menu's Face buttons row (settings.txt labels=, kept per device), or until the player chooses there DM_PAD_LABEL=1 in env.txt
@@ -265,7 +338,7 @@ static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the botto
     default: return 0;
     }
 }
-static int32_t axis(float v) { if (v > -0.12f && v < 0.12f) return 0; return (int32_t)(v * DM_STICK_MAX); }
+static int32_t axis(float v) { return dm_stick_axis(v); }
 static uint64_t g_shake_btn;   // DM_BTN_SHAKE while the device is being shaken (below); input thread only
 static uint64_t pad_axis_buttons(const float axes[8]) {
     uint64_t b = 0;
@@ -277,9 +350,62 @@ static uint64_t pad_axis_buttons(const float axes[8]) {
     if (axes[7] > 0.5f) b |= DM_BTN_DOWN;
     return b;
 }
-static void pad_publish(void) {
-    uint64_t b = g_btn | g_shake_btn | pad_axis_buttons(g_ax);
-    dm_pad_set(b, axis(g_ax[0]), -axis(g_ax[1]), axis(g_ax[2]), -axis(g_ax[3]));   // Android's y grows downward, the Switch's upward
+static void pad_publish(int p) {   // caller holds g_slot_mu
+    uint64_t b = g_btn[p] | (p ? 0 : g_shake_btn) | pad_axis_buttons(g_ax[p]);
+    int32_t lx, ly, rx, ry; dm_stick_xy(g_ax[p][0], g_ax[p][1], &lx, &ly); dm_stick_xy(g_ax[p][2], g_ax[p][3], &rx, &ry);
+    dm_pad_set_player(p, b, lx, -ly, rx, -ry);   // Android's y grows downward, the Switch's upward
+}
+static const void *pad_owner(int id) { return (const void *)((uintptr_t)(uint32_t)id + 1); }   // the slot table's key for a device id (never null)
+// Devices that sent input and hold no slot, so the input thread asks Java about each once: st 0, not a controller as pad_watch counts one (a keyboard's or a
+// remote's keys, `adb shell input`'s virtual device): its input is player 1's, as all input was before, and it takes no slot; 1, a controller that has sent
+// only idle reports so far (issue #210's silent system device: it never takes a player); 2, a controller refused because every player is taken (logged once,
+// and asked about again only when a player is free, pad_gone). Caller holds g_slot_mu
+static struct { int id, st; } g_noslot[16]; static int g_nnoslot;
+// The player of a device's input: its slot, taken the first time it sends input that counts (take: a mapped key going down, or an axis past its dead zone or threshold, the
+// test pad_mark_used is called on); 0 for a device that is not a controller; -1 for a controller with no player. Caller holds g_slot_mu
+static int pad_player(int id, int32_t src, int take) {
+    if (g_pad_merge < 0) { const char *e = getenv("DM_PAD_MERGE"); g_pad_merge = e && atoi(e) != 0; }
+    if (g_pad_merge) return 0;
+    int p = pad_slot_of(&g_slots, pad_owner(id)); if (p >= 0) return p;
+    int i = 0; while (i < g_nnoslot && g_noslot[i].id != id) i++;
+    if (i == g_nnoslot) {   // its first input: pad_watch's test (not virtual, a gamepad or a joystick); the event's source stands in when Java cannot be asked
+        int k = pad_dev_kind(id);
+        if (k == -2) k = id >= 0 && ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK);
+        if (i == 16) { memmove(g_noslot, g_noslot + 1, 15 * sizeof *g_noslot); i = 15; } else g_nnoslot++;
+        g_noslot[i].id = id; g_noslot[i].st = k == 1;   // (gone already: pad_watch would not count it either)
+        if (k != 1) LOG("[input] device %d is not a controller: its input is player 1's, and it takes no player", id);
+    }
+    if (!g_noslot[i].st) return 0;
+    if (g_noslot[i].st == 2 || !take) return -1;
+    const char *key = ""; for (int j = 0; j < g_ndev_key; j++) if (g_dev_key[j].id == id) key = g_dev_key[j].key;
+    char now[64]; if (!*key) { pad_key_now(id, now, sizeof now); key = now; }
+    int q = pad_slot_named(&g_slots, key);   // a fast reconnect: the same controller back under a new id before pad_watch's next poll freed the old one
+    if (q >= 0) { int old = (int)((uintptr_t)g_slots.owner[q] - 1);
+        if (pad_dev_kind(old) == -1) { pad_slot_free(&g_slots, g_slots.owner[q]); LOG("[input] controller (device %d) is back as device %d", old, id); } }
+    p = pad_slot_take(&g_slots, pad_owner(id), key);
+    if (p < 0) { g_noslot[i].st = 2; LOG("[input] controller (device %d): all %d players are taken, it is not used until one is free", id, DM_PLAYERS); return -1; }
+    g_noslot[i] = g_noslot[--g_nnoslot];   // (it holds a slot now)
+    g_btn[p] = 0; memset(g_ax[p], 0, sizeof g_ax[p]);
+    LOG("[input] controller (device %d) is player %d (npad %#x)", id, p + 1, dm_player_npad(p));
+    return p;
+}
+static void pad_learn(int id, const char *key) {   // pad_watch: a controller's descriptor, kept for when it takes a slot (and on the slot it holds already)
+    pthread_mutex_lock(&g_slot_mu);
+    int i = 0; while (i < g_ndev_key && g_dev_key[i].id != id) i++;
+    if (i == 16) { memmove(g_dev_key, g_dev_key + 1, 15 * sizeof *g_dev_key); i = 15; } else if (i == g_ndev_key) g_ndev_key++;
+    g_dev_key[i].id = id; snprintf(g_dev_key[i].key, sizeof g_dev_key[i].key, "%s", key);
+    int p = pad_slot_of(&g_slots, pad_owner(id)); if (p >= 0) snprintf(g_slots.last[p], sizeof g_slots.last[p], "%s", key);
+    pthread_mutex_unlock(&g_slot_mu);
+}
+static void pad_gone(int id) {   // pad_watch: the device went; its player is free, with nothing left pressed, and a controller refused for want of a player may take it
+    pthread_mutex_lock(&g_slot_mu);
+    int p = pad_slot_free(&g_slots, pad_owner(id));
+    for (int i = 0; i < g_nnoslot; ) if (g_noslot[i].id == id) g_noslot[i] = g_noslot[--g_nnoslot]; else { if (p >= 0 && g_noslot[i].st == 2) g_noslot[i].st = 1; i++; }
+    if (p >= 0) { g_btn[p] = 0; memset(g_ax[p], 0, sizeof g_ax[p]); pad_publish(p); dm_pad_players(pad_slot_mask(&g_slots) | 1); LOG("[input] player %d is free", p + 1); }
+    // player 1's controller went: its rumble back to the phone until the next player 1 sends input (pad_mark_used); pad_watch hands it back only when no controller is
+    // in use, so with player 2's still in use the game's rumble went to a device that was gone. (Under the lock: a controller taking player 1 next routes it after this)
+    if (p == 0) dm_haptics_android_device(-1);
+    pthread_mutex_unlock(&g_slot_mu);
 }
 // ---- the on-screen gamepad (overlay_layout.h): a pointer that goes down on a control keeps it until it lifts; every other pointer is the game's touch screen ----
 static _Atomic int g_overlay = 1;   // shown until a controller sends input, restored at the next touch if enabled
@@ -306,7 +432,10 @@ int dm_overlay_custom(int layout, int ctl, float *x, float *y, float *s) {   // 
     *x = (cx - 1) / 10000.0f; *y = (cy - 1) / 10000.0f; return 1;
 }
 int dm_overlay_custom_ver(void) { return atomic_load(&g_cust_ver); }
-int dm_overlay_hidden(int layout, int ctl) { return layout >= 0 && layout <= 1 && ctl >= 0 && ctl < OV_N && atomic_load(&g_cust[atomic_load(&g_edit) ? 1 : 0][layout][ctl][3]); }
+int dm_overlay_hidden(int layout, int ctl) {
+    return layout >= 0 && layout <= 1 && ctl >= 0 && ctl < OV_N
+        && (atomic_load(&g_cust[atomic_load(&g_edit) ? 1 : 0][layout][ctl][3]) || (OV_LAYOUTS[layout][ctl].kind == OV_MENU && !atomic_load(&g_menu_btn)));
+}
 int dm_overlay_off(int layout, int ctl) { return !atomic_load(&g_edit) && dm_overlay_hidden(layout, ctl); }
 float dm_overlay_opacity(void) { return atomic_load(&g_set_opacity) / 100.0f; }
 static void cust_place(int set, int l, int i, float x, float y) { atomic_store(&g_cust[set][l][i][0], 1 + (int)lroundf(x * 10000)); atomic_store(&g_cust[set][l][i][1], 1 + (int)lroundf(y * 10000)); }
@@ -344,8 +473,8 @@ JNIEXPORT jfloatArray JNICALL Java_org_nx2a_ExternalActivity_externalOverlay(JNI
         if (c->kind == OV_DPAD) { for (int d = 0; d < 4; d++) if (dm_overlay_pressed(i, OV_DPAD_BITS[d])) held |= 1u << d; }
         else if (dm_overlay_pressed(i, 0)) held = 1;
         jfloat *v = &values[4 + i * 9];
-        // v[0] = -1: hidden by the player (ExternalActivity draws nothing of it)
-        v[0] = ov_off(c) ? -1 : c->kind; v[1] = b[0]; v[2] = b[1]; v[3] = b[2]; v[4] = b[3]; v[5] = (jfloat)held; v[6] = kx; v[7] = ky; v[8] = ov_cscale(c);
+        // v[0] = -1: hidden by the player (ExternalActivity draws nothing of it). The menu button stays: the second screen's own way to the menu, beside the game
+        v[0] = ov_off(c) && c->kind != OV_MENU ? -1 : c->kind; v[1] = b[0]; v[2] = b[1]; v[3] = b[2]; v[4] = b[3]; v[5] = (jfloat)held; v[6] = kx; v[7] = ky; v[8] = ov_cscale(c);
     }
     values[4 + OV_N * 9] = dm_overlay_visible();
     jfloatArray out = (*env)->NewFloatArray(env, (jsize)(5 + OV_N * 9));
@@ -353,6 +482,7 @@ JNIEXPORT jfloatArray JNICALL Java_org_nx2a_ExternalActivity_externalOverlay(JNI
     return out;
 }
 static int g_ptr_ctl[32];   // pointer id → control index + 1 (0 = the touch screen)
+static float g_ptr_origin[32][2];
 static int ctl_at(float x, float y, float W, float H) {   // the control under (x, y) in pixels, -1 if none (in the layout editor: every control, shown or not)
     int best = -1, vis = atomic_load(&g_edit) ? 1 : dm_overlay_visible(), shown = vis == 1; float bd = 1e9f;
     if (!vis) return -1;   // no overlay: every touch is the game's
@@ -387,7 +517,6 @@ static void menu_drag(const ov_ctl *m, float x, float y, float W, float H) {   /
 // when it is a gamepad or a joystick and not virtual (the tablet's own keys, touch screen and pen are neither), and once it has sent input: Xiaomi phones
 // keep a system device "uinput-xiaomi" attached for good that says it is a gamepad (issues #22, #210). The count controls vibration routing.
 // When the last used controller goes, the overlay can return and vibration returns to the phone ----
-static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
 static void *pad_watch(void *a) {
     JavaVM *vm = a; JNIEnv *E; pthread_setname_np(pthread_self(), "padwatch");
     if ((*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) { LOG("[RED] [input] cannot attach to the Java VM: attached controllers are not watched"); return NULL; }
@@ -395,6 +524,7 @@ static void *pad_watch(void *a) {
     jmethodID mIds = cID ? (*E)->GetStaticMethodID(E, cID, "getDeviceIds", "()[I") : NULL, mGet = cID ? (*E)->GetStaticMethodID(E, cID, "getDevice", "(I)Landroid/view/InputDevice;") : NULL;
     jmethodID mSrc = cID ? (*E)->GetMethodID(E, cID, "getSources", "()I") : NULL, mVirt = cID ? (*E)->GetMethodID(E, cID, "isVirtual", "()Z") : NULL;
     jmethodID mName = cID ? (*E)->GetMethodID(E, cID, "getName", "()Ljava/lang/String;") : NULL;
+    jmethodID mDesc = cID ? (*E)->GetMethodID(E, cID, "getDescriptor", "()Ljava/lang/String;") : NULL; jx(E);   // optional: the name stands in without it
     jmethodID mVen = cID ? (*E)->GetMethodID(E, cID, "getVendorId", "()I") : NULL, mProd = cID ? (*E)->GetMethodID(E, cID, "getProductId", "()I") : NULL;
     if (jx(E) || !mIds || !mGet || !mSrc || !mVirt || !mName || !mVen || !mProd) { LOG("[RED] [input] InputDevice methods missing: attached controllers are not watched"); return NULL; }
     int prev[16], used[16], np = 0;
@@ -413,6 +543,10 @@ static void *pad_watch(void *a) {
                         jstring s = (*E)->CallObjectMethod(E, d, mName); const char *nm = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
                         jint ven = (*E)->CallIntMethod(E, d, mVen), prod = (*E)->CallIntMethod(E, d, mProd); jx(E);
                         LOG("[input] controller attached: %s (device %d, sources 0x%x, %04x:%04x)", nm ? nm : "?", v[i], src, ven, prod);
+                        jstring ds = mDesc ? (*E)->CallObjectMethod(E, d, mDesc) : NULL; const char *dk = !jx(E) && ds ? (*E)->GetStringUTFChars(E, ds, NULL) : NULL;
+                        pad_learn(v[i], dk && *dk ? dk : nm ? nm : "");
+                        if (dk) (*E)->ReleaseStringUTFChars(E, ds, dk);
+                        if (ds) (*E)->DeleteLocalRef(E, ds);
                         if (nm) (*E)->ReleaseStringUTFChars(E, s, nm);
                         if (s) (*E)->DeleteLocalRef(E, s);
                     }
@@ -424,7 +558,7 @@ static void *pad_watch(void *a) {
             if (v) (*E)->ReleaseIntArrayElements(E, arr, v, JNI_ABORT);
             (*E)->DeleteLocalRef(E, arr);
         }
-        for (int k = 0; k < np; k++) { int still = 0; for (int i = 0; i < n; i++) still |= ids[i] == prev[k]; if (!still) LOG("[input] controller detached (device %d)", prev[k]); }
+        for (int k = 0; k < np; k++) { int still = 0; for (int i = 0; i < n; i++) still |= ids[i] == prev[k]; if (!still) { LOG("[input] controller detached (device %d)", prev[k]); pad_gone(prev[k]); } }
         if (atomic_exchange(&g_pads, nu) && !nu) {   // the last one went: the device's motor for rumble
             atomic_store(&g_overlay, 1); dm_haptics_android_device(-1);
             LOG("[input] no controller in use: vibration returns to the phone");
@@ -492,14 +626,15 @@ static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (o
 static _Atomic int g_sp_on, g_sp_hi = -1, g_sp_ver;   // the save picker (below): open, its highlighted row, its edit count
 static _Atomic int g_sv_st, g_sv_n;                   // Export save: its outcome (overlay_layout.h OVX_*), the exports made
 int dm_menu_state(void) {
-    if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
+    if (atomic_load(&g_tx_on)) return OVT_ST | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28;
+           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 19 | (atomic_load(&g_fps_ver) & 3) << 29 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28;
 }
-int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
+// gfx_vk_present.c draws the counter: not while the menu holds the game, except under the pause menu's Counter and Style tabs, where it shows what they change
+int dm_overlay_fps(void) { return atomic_load(&g_menu) ? atomic_load(&g_menu_tab) >= 2 && !atomic_load(&g_edit) && !atomic_load(&g_sp_on) && !atomic_load(&g_tx_on) : atomic_load(&g_set_fps); }
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
     atomic_store(&g_menu_hi, hi); g_menu_ptr = -1;
@@ -507,7 +642,7 @@ static void menu_open(int hi) {
     dm_input_set(0, 0, 0, 0, 0); dm_touch_set(NULL, 0); atomic_store(&g_touch_btn, 0);   // nothing stays pressed in the game
     for (int i = 0; i < 16; i++) atomic_store(&g_press_t[i], 0);
     for (int s = 0; s < 2; s++) { atomic_store(&g_stick_t[s], 0); for (int a = 0; a < 2; a++) atomic_store(&g_knob[s][a], 0); }
-    if (g_pad_used) { g_btn = 0; memset(g_ax, 0, sizeof g_ax); pad_publish(); }
+    if (g_pad_used) { pthread_mutex_lock(&g_slot_mu); for (int p = 0; p < DM_PLAYERS; p++) { g_btn[p] = 0; memset(g_ax[p], 0, sizeof g_ax[p]); pad_publish(p); } pthread_mutex_unlock(&g_slot_mu); }
     for (int i = 0; i < 32; i++) g_ptr_ctl[i] = 0;
     dm_haptics_suspend(4, 1);   // (bits 1 and 2 are the iOS front end's reasons)
     hold_sync(); dm_overlay_redraw();
@@ -520,8 +655,8 @@ static void menu_close(void) {
     if (!atomic_exchange(&g_menu, 0)) return;
     g_menu_ptr = -1; atomic_store(&g_menu_t, 0);
     hold_sync(); dm_haptics_suspend(4, 0); dm_overlay_redraw();
-    LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, face buttons by %s, frame rate %s, %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
-        atomic_load(&g_set_rumble) ? "on" : "off", pad_labels() ? "label" : "position", atomic_load(&g_set_fps) ? "shown" : "hidden", dm_opmode() ? "docked" : "handheld");
+    LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, face buttons by %s, frame rate %s %#x, %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
+        atomic_load(&g_set_rumble) ? "on" : "off", pad_labels() ? "label" : "position", atomic_load(&g_set_fps) ? "shown" : "hidden", atomic_load(&g_fps_opts), dm_opmode() ? "docked" : "handheld");
 }
 static void menu_opacity(int v) {   // the slider: a new value is drawn at once and saved when the finger lifts (menu_touch) or with each controller step
     v = v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v;
@@ -560,6 +695,7 @@ static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
+    else if (fps_opt_press(item)) settings_save();   // the counter's rows, corner, colour, outline and size
     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
     else if (item == OVM_PAD) { atomic_store(&g_set_labels, !pad_labels()); settings_save(); }   // at once (pad_labels)
     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
@@ -961,6 +1097,7 @@ static void touch_event(AInputEvent *e) {
         int i = act == AMOTION_EVENT_ACTION_DOWN ? 0 : ai, id = AMotionEvent_getPointerId(e, (size_t)i) & 31;
         int c = ctl_at(AMotionEvent_getX(e, (size_t)i), AMotionEvent_getY(e, (size_t)i), W, H);
         g_ptr_ctl[id] = c + 1;
+        g_ptr_origin[id][0] = AMotionEvent_getX(e, (size_t)i); g_ptr_origin[id][1] = AMotionEvent_getY(e, (size_t)i);
         if (c >= 0 && OV_CTLS[c].kind == OV_MENU) { atomic_store(&g_menu_t, mono_ns()); dm_haptics_android_tap(); menu_grab(id, &OV_CTLS[c], AMotionEvent_getX(e, (size_t)i), AMotionEvent_getY(e, (size_t)i), W, H); }
         if (!atomic_exchange(&g_overlay, 1) && !atomic_load(&g_pads)) dm_haptics_android_device(-1);   // keep vibration on a used controller that is still attached
     }
@@ -992,8 +1129,10 @@ static void touch_event(AInputEvent *e) {
                 static const uint64_t dir[8] = {DM_BTN_RIGHT, DM_BTN_RIGHT | DM_BTN_DOWN, DM_BTN_DOWN, DM_BTN_DOWN | DM_BTN_LEFT, DM_BTN_LEFT, DM_BTN_LEFT | DM_BTN_UP, DM_BTN_UP, DM_BTN_UP | DM_BTN_RIGHT};
                 btn |= dir[s]; }
         } else {
-            if (m > 1) { dx /= m; dy /= m; }
-            kn[k->kind == OV_STICK_R][0] = dx; kn[k->kind == OV_STICK_R][1] = dy; held[k->kind == OV_STICK_R] = 1;   // the knob follows the finger (to the ring)
+            float ox = fminf(fmaxf(g_ptr_origin[id][0], b[2]), W - b[2]);
+            float oy = fminf(fmaxf(g_ptr_origin[id][1], b[2]), H - b[2]);
+            ov_touch_stick(x - ox, y - oy, b[2], k->kind == OV_STICK_R, &dx, &dy);
+            kn[k->kind == OV_STICK_R][0] = dx; kn[k->kind == OV_STICK_R][1] = dy; held[k->kind == OV_STICK_R] = 1;   // the knob shows the output
             int32_t sx = (int32_t)(dx * DM_STICK_MAX), sy = (int32_t)(-dy * DM_STICK_MAX);
             if (k->kind == OV_STICK_L) { lx = sx; ly = sy; } else { rx = sx; ry = sy; }
         }
@@ -1008,11 +1147,15 @@ static void touch_event(AInputEvent *e) {
     dm_touch_set(t, n);
     if (open) menu_open(-1);
 }
-static void pad_mark_used(int32_t device) {
-    atomic_store(&g_overlay, 0);
+static void pad_mark_used(int32_t device, int p) {   // p: the player its input goes to (pad_player)
     g_pad_used = 1;
     atomic_store(&g_pad_in, device);
-    dm_haptics_android_device(device);
+    // The touch gamepad and the game's rumble are player 1's as the game sees it: player 1's own input, and in a one-player game every player's, which hle_hid.c merges into
+    // player 1 (dm_player_seen_as). Another player's input (or a controller's with no player) leaves them as they are: after player 1's controller went, player 1 plays on
+    // touch, and player 2's presses used to hide those controls (PR #238 review)
+    if (dm_player_seen_as(p) != 0) return;
+    atomic_store(&g_overlay, 0);
+    dm_haptics_android_device(device);   // the game's rumble goes to player 1's controller
 }
 static int handle_event(AInputEvent *e) {
     int32_t src = AInputEvent_getSource(e), type = AInputEvent_getType(e);
@@ -1030,10 +1173,14 @@ static int handle_event(AInputEvent *e) {
                 seen[k >> 3] |= (uint8_t)(1 << (k & 7)); LOG("[input] controller key %d (device %d): not mapped", k, AInputEvent_getDeviceId(e)); }
             return 0;
         }
-        if (down) pad_mark_used(AInputEvent_getDeviceId(e));   // a release after a touch must not hide the controls again
+        int id = AInputEvent_getDeviceId(e);
+        pthread_mutex_lock(&g_slot_mu); int p = pad_player(id, src, down); pthread_mutex_unlock(&g_slot_mu);   // (a release takes no player either)
+        if (down) pad_mark_used(id, p);   // a release after a touch must not hide the controls again
         if (atomic_load(&g_menu)) { if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
-        if (down) g_btn |= bit; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_btn &= ~bit;
-        dm_pad_players(1); pad_publish(); return 1;
+        if (p < 0) return 1;
+        pthread_mutex_lock(&g_slot_mu);
+        if (down) g_btn[p] |= bit; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_btn[p] &= ~bit;
+        dm_pad_players(pad_slot_mask(&g_slots) | 1); pad_publish(p); pthread_mutex_unlock(&g_slot_mu); return 1;
     }
     if (atomic_load(&g_tx_on) && ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD)) {
         // the d-pad (reported as a hat on Retroid and many Android handhelds) or the left stick moves the text-entry highlight on edge transitions, as the pause menu uses the hat; touch taps the keys (tx_touch)
@@ -1057,17 +1204,19 @@ static int handle_event(AInputEvent *e) {
         };
         if (axes[4] == 0) axes[4] = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_BRAKE, 0);
         if (axes[5] == 0) axes[5] = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_GAS, 0);
-        // Idle reports still release game inputs, but only a mapped axis outside its dead zone takes over from touch.
-        if (axis(axes[0]) || axis(axes[1]) || axis(axes[2]) || axis(axes[3]) || pad_axis_buttons(axes))
-            pad_mark_used(AInputEvent_getDeviceId(e));
+        // Idle reports still release game inputs, but only a mapped axis outside its dead zone takes over from touch, or takes a player.
+        int id = AInputEvent_getDeviceId(e), live = axis(axes[0]) || axis(axes[1]) || axis(axes[2]) || axis(axes[3]) || pad_axis_buttons(axes);
+        pthread_mutex_lock(&g_slot_mu); int p = pad_player(id, src, live); pthread_mutex_unlock(&g_slot_mu);
+        if (live) pad_mark_used(id, p);
         if (atomic_load(&g_menu)) {   // the hat moves the selection
             static float hx, hy; float x = axes[6], y = axes[7];
             if (y < -0.5f && hy >= -0.5f) menu_key(DM_BTN_UP); else if (y > 0.5f && hy <= 0.5f) menu_key(DM_BTN_DOWN);
             if (x < -0.5f && hx >= -0.5f) menu_key(DM_BTN_LEFT); else if (x > 0.5f && hx <= 0.5f) menu_key(DM_BTN_RIGHT);
             hx = x; hy = y; return 1;
         }
-        memcpy(g_ax, axes, sizeof g_ax);
-        dm_pad_players(1); pad_publish(); return 1;
+        if (p < 0) return 1;   // a controller with no player: its idle reports have nothing to release (given to player 1, they let go of player 1's stick)
+        pthread_mutex_lock(&g_slot_mu); memcpy(g_ax[p], axes, sizeof g_ax[p]);
+        dm_pad_players(pad_slot_mask(&g_slots) | 1); pad_publish(p); pthread_mutex_unlock(&g_slot_mu); return 1;
     }
     if ((src & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) { touch_event(e); return 1; }
     return 0;
@@ -1168,7 +1317,7 @@ static int on_sensor(int fd, int events, void *data) {
         int on = last >= 0 && ev[i].timestamp - last < 120000000;
         if (!on && last >= 0) { LOG("front end: device shaken (peak %.1f G)", peak); last = -1; }
         uint64_t want = on ? DM_BTN_SHAKE : 0;
-        if (want != g_shake_btn) { g_shake_btn = want; pad_publish(); }
+        if (want != g_shake_btn) { g_shake_btn = want; pthread_mutex_lock(&g_slot_mu); pad_publish(0); pthread_mutex_unlock(&g_slot_mu); }
     }
     return 1;
 }
@@ -1188,7 +1337,20 @@ static void shake_start(void) {
     shake_sensor(!atomic_load(&g_bg));
 }
 static void *input_thread(void *a) {
-    (void)a; g_ilooper = ALooper_prepare(0);
+    (void)a; JNIEnv *E;
+    if (g_vm && (*g_vm)->AttachCurrentThread(g_vm, &E, NULL) == JNI_OK) {   // for pad_key_now and pad_dev_kind; InputDevice.getDevice and getName are needed, getDescriptor is optional
+        jclass c = (*E)->FindClass(E, "android/view/InputDevice");
+        if (!jx(E) && c) {
+            g_in_get = (*E)->GetStaticMethodID(E, c, "getDevice", "(I)Landroid/view/InputDevice;"); jx(E);
+            g_in_desc = (*E)->GetMethodID(E, c, "getDescriptor", "()Ljava/lang/String;"); jx(E);
+            g_in_name = (*E)->GetMethodID(E, c, "getName", "()Ljava/lang/String;"); jx(E);
+            g_in_src = (*E)->GetMethodID(E, c, "getSources", "()I"); jx(E);   // pad_dev_kind: without these the event's source decides
+            g_in_virt = (*E)->GetMethodID(E, c, "isVirtual", "()Z"); jx(E);
+            if (g_in_get && g_in_name) g_in_cls = (*E)->NewGlobalRef(E, c);
+            (*E)->DeleteLocalRef(E, c);
+        }
+    }
+    g_ilooper = ALooper_prepare(0);
     shake_start();
     uint64_t prev = 0, latched = 0, sample = 0; int64_t since = 0;
     for (;;) {
@@ -1215,13 +1377,76 @@ static void on_queue_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AI
 
 // ---- the host ----
 int main(int argc, char **argv);   // dm/host/main.c
+static void runtime_exception(JNIEnv *env, const char *where) {
+    jthrowable error = (*env)->ExceptionOccurred(env); (*env)->ExceptionClear(env);
+    jclass log_type = NULL, type = NULL; jstring text = NULL; const char *message = NULL;
+    log_type = (*env)->FindClass(env, "android/util/Log");
+    if (!log_type || (*env)->ExceptionCheck(env)) goto exception_fallback;
+    jmethodID stack = (*env)->GetStaticMethodID(env, log_type, "getStackTraceString", "(Ljava/lang/Throwable;)Ljava/lang/String;");
+    if (!stack || (*env)->ExceptionCheck(env)) goto exception_fallback;
+    text = (*env)->CallStaticObjectMethod(env, log_type, stack, error);
+    if (!text || (*env)->ExceptionCheck(env)) goto exception_fallback;
+    message = (*env)->GetStringUTFChars(env, text, NULL);
+    if (message && message[0]) goto exception_done;
+exception_fallback:
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (message) { (*env)->ReleaseStringUTFChars(env, text, message); message = NULL; }
+    if (text) { (*env)->DeleteLocalRef(env, text); text = NULL; }
+    type = (*env)->GetObjectClass(env, error);
+    if (!type || (*env)->ExceptionCheck(env)) goto exception_done;
+    jmethodID to_string = (*env)->GetMethodID(env, type, "toString", "()Ljava/lang/String;");
+    if (!to_string || (*env)->ExceptionCheck(env)) goto exception_done;
+    text = (*env)->CallObjectMethod(env, error, to_string);
+    if (!text || (*env)->ExceptionCheck(env)) goto exception_done;
+    message = (*env)->GetStringUTFChars(env, text, NULL);
+exception_done:
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    LOG("[RED] runtime %s failed:\n%s", where, message ? message : "cannot describe Java exception");
+    if (message) (*env)->ReleaseStringUTFChars(env, text, message);
+    if (text) (*env)->DeleteLocalRef(env, text);
+    if (type) (*env)->DeleteLocalRef(env, type);
+    if (log_type) (*env)->DeleteLocalRef(env, log_type);
+    (*env)->DeleteLocalRef(env, error);
+}
+static void runtime_default(const char *key, const char *name) {
+    char old[1100], legacy[1100], path[1200];
+    snprintf(old, sizeof old, "%s/%s", g_root, name);
+    const char *tail = strstr(g_root, "/Android/data/");
+    snprintf(legacy, sizeof legacy, "/sdcard%s/%s", tail ? tail : "", name);
+    snprintf(path, sizeof path, "%s/%s", g_runtime, name);
+    const char *value = getenv(key);
+    if (!access(path, R_OK) && (!value || !strcmp(value, old) || (tail && !strcmp(value, legacy)))) setenv(key, path, 1);
+}
 static void *host_thread(void *a) {
     (void)a;
-    char mods[600]; snprintf(mods, sizeof mods, "%s/mods", g_root);
+    if (g_runtime_class) {
+        JavaVM *vm = g_act->vm; JNIEnv *env;
+        LOG("[runtime] preparing bundled runtime");
+        if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) {
+            LOG("[RED] runtime preparation failed: cannot attach to the Java VM"); g_quit = 1; return NULL;
+        }
+        jstring root = (*env)->CallStaticObjectMethod(env, g_runtime_class, g_runtime_prepare, g_act->clazz);
+        if ((*env)->ExceptionCheck(env)) {
+            runtime_exception(env, "preparation");
+        } else if (root) {
+            const char *value = (*env)->GetStringUTFChars(env, root, NULL);
+            snprintf(g_runtime, sizeof g_runtime, "%s", value);
+            (*env)->ReleaseStringUTFChars(env, root, value); (*env)->DeleteLocalRef(env, root);
+        } else LOG("[RED] runtime preparation failed: bundled manifest is unavailable");
+        (*env)->DeleteGlobalRef(env, g_runtime_class); g_runtime_class = NULL;
+        (*vm)->DetachCurrentThread(vm);
+        if (!g_runtime[0]) { g_quit = 1; return NULL; }
+        runtime_default("DM_VK_SHADERS", "shaders.dmsv");
+        runtime_default("DM_SHARED_FONT_EXT", "nintendo_ext.ttf");
+        runtime_default("DM_FPS_LOCKS", "fpslock.tsv");
+        LOG("[runtime] bundled runtime ready: %s", g_runtime);
+    }
+    char mods[1100]; snprintf(mods, sizeof mods, "%s/mods", g_runtime[0] ? g_runtime : g_root);
     char *argv[] = {"dmhost", mods, NULL};
     atomic_store(&g_running, 1);
     int rc = main(2, argv);
     LOG("host returned %d", rc);
+    { void hlecount_flush(void); hlecount_flush(); }   // DM_HLECOUNT: nnMain's normal return also leaves by _exit, which does not run atexit
     dm_perf_gpu_release();   // the game ended itself: the device-wide KGSL property outlives the process (perf_android.c)
     _exit(rc);
 }
@@ -1286,7 +1511,6 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     g_act = act;
     int sdk; { AConfiguration *cfg = AConfiguration_new(); AConfiguration_fromAssetManager(cfg, act->assetManager); g_dpi = AConfiguration_getDensity(cfg); sdk = AConfiguration_getSdkVersion(cfg); AConfiguration_delete(cfg); }
     act->callbacks->onNativeWindowCreated = on_window_created; act->callbacks->onNativeWindowDestroyed = on_window_destroyed;
-    act->callbacks->onInputQueueCreated = on_queue_created; act->callbacks->onInputQueueDestroyed = on_queue_destroyed;
     act->callbacks->onPause = on_pause; act->callbacks->onResume = on_resume; act->callbacks->onWindowFocusChanged = on_window_focus; act->callbacks->onDestroy = on_destroy;
     ANativeActivity_setWindowFlags(act, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
     static int started; if (started++) return;   // a second onCreate (configuration change) keeps the running game
@@ -1306,11 +1530,15 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/log.txt", g_root); char prev[720]; snprintf(prev, sizeof prev, "%s/log.prev.txt", g_root); rename(p, prev);
     if (!freopen(p, "w", stderr)) __android_log_print(ANDROID_LOG_ERROR, "dmhost", "cannot write %s", p);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    LOG("[runtime] startup title=%s host_compiled=%s %s", DM_GAME_ID, __DATE__, __TIME__);
+    LOG("[runtime] environment BEGIN");
     setenv("DM_ROOT", g_root, 1);
     snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
+    LOG("[runtime] environment DONE");
+    LOG("[runtime] env file BEGIN");
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
     if (mod_start) {
         jstring title = (*env)->NewStringUTF(env, DM_ANDROID_TITLE_ID);
@@ -1323,13 +1551,71 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
         }
         (*env)->DeleteLocalRef(env, title);
     }
+    LOG("[runtime] env file DONE");
+    LOG("[runtime] manifest detection BEGIN");
+    AAsset *bundle = AAssetManager_open(act->assetManager, "runtime/manifest.json", AASSET_MODE_STREAMING);
+    LOG("[runtime] manifest detection DONE present=%d", bundle != NULL);
+    if (bundle) {
+        AAsset_close(bundle);
+        LOG("[runtime] helper lookup BEGIN");
+        jclass activity_type = NULL, loader_type = NULL, cls = NULL;
+        jobject loader = NULL; jstring name = NULL;
+        activity_type = (*env)->GetObjectClass(env, act->clazz);
+        if (!activity_type || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        jmethodID get_loader = (*env)->GetMethodID(env, activity_type, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        if (!get_loader || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        loader = (*env)->CallObjectMethod(env, act->clazz, get_loader);
+        if (!loader || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        LOG("[runtime] helper loader acquired");
+        loader_type = (*env)->GetObjectClass(env, loader);
+        if (!loader_type || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        jmethodID load_class = (*env)->GetMethodID(env, loader_type, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        if (!load_class || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        name = (*env)->NewStringUTF(env, "org.nx2a.RuntimeBundle");
+        if (!name || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        cls = (*env)->CallObjectMethod(env, loader, load_class, name);
+        if (!cls || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        LOG("[runtime] helper class loaded");
+        g_runtime_prepare = (*env)->GetStaticMethodID(env, cls, "prepare", "(Landroid/content/Context;)Ljava/lang/String;");
+        if (!g_runtime_prepare || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        g_runtime_check_data = (*env)->GetStaticMethodID(env, cls, "checkData", "(Landroid/app/Activity;Ljava/lang/String;)Z");
+        if (!g_runtime_check_data || (*env)->ExceptionCheck(env)) goto runtime_lookup_done;
+        g_runtime_class = (*env)->NewGlobalRef(env, cls);
+runtime_lookup_done:
+        if ((*env)->ExceptionCheck(env)) {
+            runtime_exception(env, "helper lookup");
+            if (g_runtime_class) { (*env)->DeleteGlobalRef(env, g_runtime_class); g_runtime_class = NULL; }
+        }
+        if (name) (*env)->DeleteLocalRef(env, name);
+        if (cls) (*env)->DeleteLocalRef(env, cls);
+        if (loader_type) (*env)->DeleteLocalRef(env, loader_type);
+        if (loader) (*env)->DeleteLocalRef(env, loader);
+        if (activity_type) (*env)->DeleteLocalRef(env, activity_type);
+        if (!g_runtime_class || !g_runtime_prepare || !g_runtime_check_data) { LOG("[RED] runtime preparation failed: APK runtime helper is unavailable"); g_quit = 1; return; }
+        LOG("[runtime] helper lookup DONE");
+    }
+    { const char *e = getenv("DM_MENU_BUTTON"); if (e && *e && !atoi(e)) { atomic_store(&g_menu_btn, 0); LOG("[overlay] DM_MENU_BUTTON=0: no menu button (Back opens the menu)"); } }
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
-    if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
+    LOG("[runtime] saves start BEGIN");
+    int saves_end = dm_saves_start(g_root);
+    LOG("[runtime] saves start DONE end=%d", saves_end);
+    if (saves_end) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
+    if (g_runtime_class) {
+        jstring romfs = (*env)->NewStringUTF(env, getenv("DM_ROMFS"));
+        LOG("[runtime] data check BEGIN");
+        jboolean ready = (*env)->CallStaticBooleanMethod(env, g_runtime_class, g_runtime_check_data, act->clazz, romfs);
+        LOG("[runtime] data check DONE ready=%d", ready);
+        (*env)->DeleteLocalRef(env, romfs);
+        if ((*env)->ExceptionCheck(env)) { runtime_exception(env, "data check"); g_quit = 1; return; }
+        if (!ready) return;
+    }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
+    act->callbacks->onInputQueueCreated = on_queue_created; act->callbacks->onInputQueueDestroyed = on_queue_destroyed;
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
+    g_vm = act->vm;
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);

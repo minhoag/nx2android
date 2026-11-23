@@ -377,7 +377,9 @@ def site_window(seg):
         elif m == 'b':   # an unconditional branch inside a CAS window (e.g. ldaxrb; cbz <store>; clrex; b <after>; stlxrb; cbz)
             tgt = x.operands[-1].imm
             if lo <= tgt < hi: newt = copy0 + (tgt - lo)
-            elif tgt == hi: newt = exits
+            elif tgt == hi: newt = exits - 16   # the fall-through stub, which is the first one (exits is the first branch-out stub). It took exits: with ldaxrb; cbz <store>; clrex; b <after>;
+                                                # stlxrb; cbz <claimed>, a slot found in use left by the stub of <claimed> (Trails in the Sky 1st Chapter main+0x2cdeb4, its material table's
+                                                # slot search: two materials got one slot, and the one drawn with the other's entry took its glow, AYN Odin 3, 2026-11-17)
             else:
                 if tgt not in ex_targets: ex_targets.append(tgt)
                 newt = exits + 16 * ex_targets.index(tgt)
@@ -1026,6 +1028,11 @@ def spin_quick(T, hi):
 class SpinNo(Exception): pass
 def spin_region(T, bes):
     """the spin wait region with head T (bes: the backward branches to T found by the scan) → dict, or None"""
+    # Heads are visited in ascending order, and decoding stays within SPIN_WIN
+    # bytes of each head. Retire earlier details instead of caching every rejected
+    # loop in the module; keep overlap shared by the graphs awaiting emission.
+    for a in list(spin_dec):
+        if a < T: del spin_dec[a]
     hi = max(bes)
     if any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi): return None
     nodes, back, bad, inner = {}, set(), set(), set()
