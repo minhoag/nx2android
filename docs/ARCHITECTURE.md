@@ -117,6 +117,12 @@ checked before pointer formation. These checks do not change the decoder choice
 or timestamp/queue policy. The manual [AVC probe](../probes/avc_frame_layout.md)
 checks synthetic planes and padding; physical-device qualification is separate.
 
+The Android AVC adapter snapshots matrix and range with each queued picture.
+MediaCodec color metadata is accepted only for fields declared in the stream's
+SPS VUI. Without a colour description with a specified matrix it uses BT.709 at 720 lines and above,
+BT.601 below. Without a video signal type it uses limited range. Malformed or
+unsupported SPS data uses both defaults.
+
 Stopping a started guest AudioOut returns all pending buffers in queue order,
 including any partly played buffer, and wakes the guest's release event even if
 the pending queue is empty. Capacity covers all buffers accepted and yet to be
@@ -148,9 +154,12 @@ PPE3 invalidates older prewarm records. The effects shader writes PointSize, and
 discarded pipelines invalidate cached stencil state before the next raster draw.
 The split is off unless a profile sets `env DM_VK_GS_SPLIT=1` (NieR:Automata), and runs only on
 Adreno (vendor 0x5143, Qualcomm's driver or Turnip); `DM_VK_GS_SPLIT=0` restores the original path live
-for diagnosis. Likewise the first-use upload of CPU-filled uncompressed 2D textures (`gfx_vk_tex.c`
-`cpu_content_tex`, which also checks the pool for GPU-written aliases) needs `env DM_NVN_CPU_TEX2D_FIRST_USE=1`;
-without it only compressed and 3D textures are uploaded, as before.
+for diagnosis. The first-use upload of CPU-filled uncompressed 2D textures in CPU-accessible pools
+needs `env DM_NVN_CPU_TEX2D_FIRST_USE=1`. With `env DM_NVN_CPU_NO_ACCESS_IMAGE_FIRST_USE=1`, an
+uncompressed 2D colour `IMAGE` can upload initial data from `CPU_NO_ACCESS` storage once without
+CPU write tracking. Both paths check for GPU-written aliases.
+
+**Super resolution** (the pause menu's Game tab, `settings.txt` `sr=`; off by default): a window texture whose picture grows by at least a sixteenth when it is fitted to the window (a Switch game's 1920x1080 picture on a 2560x1600 tablet) is drawn into the swapchain image (or the pre-rotated copy) by Snapdragon Game Super Resolution 1.0's edge-direction fragment shader (`dm/android/shaders/sr.frag`: the base bilinear sample, its 12 taps as four `textureGather` reads, a fast-Lanczos kernel stretched along the direction the taps vote for, and the sharpening step, all in one pass; its taps clamp to the picture's crop, so a window or vi crop never reads the texels beside it) instead of the hardware blit, which only bilinearly enlarges. The upscale is one draw in the present's own submission: it reads the game's picture once and writes the composited image once, the overlay draws in the same rendering scope after it, and no intermediate image holds the upscaled frame. It needs dynamic rendering, a 2D single-sample window texture and a view, sampler and pipeline the device grants, and falls back to the blit (with one `[RED]` line) when any is missing. `DM_VK_SR=0/1` overrides the setting for a device run. The filter works on the stored values of a UNORM window texture and on the linear values of an sRGB one. Its Sharpness slider (the pause menu's row, `sharpness=`; 0 by default) moves the three values the published shader fixes: the edge threshold falls from 8/255 to 2/255, so near-flat texture is refined too, the sharpen multiplier rises from 2.0 to 8.0, and its step may pass the neighbouring texels' range (by up to 35 percent of the overshoot) and widen from 23/255 to 70/255. At 0 none of them moves and the shader is as published, with no halo at an edge; at 100 edges ring the way an emulator's sharpness at 100 does. The shader is BSD-3-Clause (`dm/android/shaders/sgsr1.LICENSE`).
 
 ## Settings
 
@@ -180,11 +189,31 @@ attribute format, including integer remaps and formats from prewarm records.
 Unsupported core formats are reported once per format across replay and prewarm
 workers; out-of-range formats are still reported without indexing the diagnostic
 array. Every unsupported pipeline is cached as failed, so draws that need it are
-skipped before Vulkan can receive an invalid pipeline.
+skipped before Vulkan can receive an invalid pipeline. A profile that sets
+`DM_VK_SCALED_FETCH=1` (off by default) has one exception: a USCALED / SSCALED
+format read by a float input is fetched as the UINT / SINT format of the same
+layout and the vertex shader converts each load to float (`vk_spv_vertex.h`,
+OpConvertUToF / OpConvertSToF), which gives the same values. Toy Story 3 Complete
+Edition sets it: the Adreno 740 has no R8G8B8A8_USCALED, the bone indices of its
+skinned characters, which were all skipped. Without the switch, and for formats
+the device fetches, pipelines are built exactly as before.
 
 ## Frame pacing
 
 How a game's frames are paced is decided in one module, `nxnative/dm/host/dm_pacing.c`: the frame-rate target (`game.tsv` `fps_target`, `DM_FPS_TARGET`), the 30 fps ceiling (`fps_ceiling`, `DM_FPS_CEILING`), the frame step's hold (`fps_hold`, `DM_FPS_HOLD`), presents on the display's ticks (`present_interval`, `DM_PRESENT_INTERVAL`), the Android governor (`DM_ADAPTIVE_FPS`, `DM_FPS_PIN`, `DM_ADAPT_UP_PCT`), the window's rate vote (`DM_VK_WINDOW_GAME_RATE`) and GPU turbo (`DM_GPU_TURBO`). The mechanisms stay where they run (the frame step in `loader.c` and `nvn_fstep.h`, the 60 fps writes in `hle_fpslock.c`, the present interval in `hle_nvn.c`, presents and the rate vote in `gfx_vk_present.c`, the governor in `perf_android.c`) and ask it. At start-up the log has the whole policy in one line (`pacing: target 60 fps (game profile fps_target), ceiling 0, hold on ...`). A profile chooses its policy with one `android.tsv` row, `pacing <preset>` (below). Test harnesses that cut the governor out of `perf_android.c` compile the real `dm_pacing.c` with it (`tests/csrc.py` `pacing_files`).
+
+## Descriptor cache hashing
+
+The Android backend's descriptor caches (`gfx_vk_exec_descriptors.inc`) find candidates by hash. Two kinds of path decide reuse differently:
+
+- **Exact.** The content-keyed set cache (`set_key`) and driver segments built and hashed (`drv_shared`'s content path) compare every byte of a candidate before reusing it, so a collision only costs a miss. Long inputs use a four-lane hash so the replay thread does not wait on one dependent multiply chain.
+- **Hash only.** Two paths reuse on a 64-bit hash alone, to avoid collecting or building anything:
+  - a stage set found again by its bindings (`rmemo_take`, keyed by order-free hashes of the stage's slots, the shader and its constant buffers' buffers);
+  - a c2 driver segment found by the hash of its slots (`drv_shared` with `DM_VK_C2_FAST`).
+
+  `DM_VK_X_SETVERIFY=1` collects one memo hit in 64 anyway and compares it, builds every c2 segment found by hash again and compares its bytes, and logs a `[RED]` line on any difference; its `memo verify` line counts both checks. `DM_VK_X_NOSETMEMO=1` and `DM_VK_C2_FAST=0` turn the two paths off for an A/B.
+
+These hashes stay in the process: they are not persisted and do not change the Vulkan pipeline-cache identity.
 
 ## Game profiles on Android
 
@@ -198,7 +227,7 @@ A profile is offered for Android when it has an `android.tsv`; the profiles with
 | `orientation` | `landscape` (default) or `any` |
 | `requires` | Device features the game needs, checked by the installer: `bcn` (BC texture compression) |
 | `sysdata` | System data titles the game reads from the console's firmware, 16-digit hex title IDs (`0100000000000802`: MiiModel, the Mii heads Mario Kart 8 Deluxe builds): the port extracts each from the player's firmware dump (`--firmware`) into the data pack's `sysdata/<title ID>/`, and the host mounts it (`DM_SYSDATA`, `dm/host/hle_fs.c`) in place of its stand-in. Titles `0100000000000811` (FontStandard) and `0100000000000810` (FontNintendoExtension) make the host serve the console's own shared fonts (`nintendo_udsg-r_std_003.bfttf`, `nintendo_ext_003.bfttf`, decoded in `hle_sdk16.c`): the standard font after `DM_SHARED_FONT` and `$DM_FONT_DIR/standard.ttf`, the extension font before porter's generated stand-in. `0100000000000814` (FontChineseSimplified: `nintendo_udsg-r_org_zh-cn_003.bfttf` for type 1, `nintendo_udsg-r_ext_zh-cn_003.bfttf` for type 2), `0100000000000813` (FontChineseTraditional: `nintendo_udjxh-db_zh-tw_003.bfttf`) and `0100000000000812` (FontKorean: `nintendo_udsg-r_ko_003.bfttf`) are shared-font types 1–4 when `DM_SHARED_FONT` is unset; a file that is not in the pack leaves that type on the standard font. Never shipped with the tool |
-| `setting` | `<name>=<value>`: the pause menu's defaults on first launch (`overlay`, `rumble`, `docked`, `fps`: the frame rate counter, off by default; `fps_rows`, `fps_pos`, `fps_colour`, `fps_outline`, `fps_size`: its rows, corner, colour, outline and size (below); `opacity`: the gamepad's, 20 to 80 percent by 5, 60 by default), written to the data pack's `settings.txt`, where the app also keeps the player's own gamepad layout from the pause menu's layout editor (`ui=` rows) and its Snap to grid (`grid`, off by default) |
+| `setting` | `<name>=<value>`: the pause menu's defaults on first launch (`overlay`, `rumble`, `docked`, `fps`: the frame rate counter, off by default; `fps_rows`, `fps_pos`, `fps_colour`, `fps_outline`, `fps_size`: its rows, corner, colour, outline and size (below); `sr`: super resolution, off by default; `sharpness`: its slider, 0 to 100 percent by 25, 0 by default (below); `opacity`: the gamepad's, 20 to 80 percent by 5, 60 by default), written to the data pack's `settings.txt`, where the app also keeps the player's own gamepad layout from the pause menu's layout editor (`ui=` rows) and its Snap to grid (`grid`, off by default) |
 | `romfs` | `raw` (default) or `zstd`: the data pack's RomFS files that compress are stored zstd-compressed and read back by the host ("Compressed RomFS" below) |
 | `vulkan_driver` | `system` (default) or `turnip`: the Vulkan driver the profile was tested with. With `turnip` the port packs Mesa's Turnip (`porter config turnip <libvulkan_freedreno.so>`, else a build under `tools/turnip`) as `--vulkan-driver` would, and says so in red when it finds none; `--vulkan-driver system` keeps the device's driver |
 | `pacing` | the frame-pacing policy in one row: `adaptive` (default: the profile's `fps_target`, the governor steps between 60, 40 and 30), `steady` (no governor steps), `fixed60`, `fixed30`, `game` (the game's own limit, no governor). Each is `env` rows before the profile's own (`android_profile.py` `PACING`); a profile may not also set one of them (Frame pacing, above) |
@@ -243,6 +272,15 @@ triggers translation. The shader key covers the three Android export helpers
 (`shader_vk.py`, `dmsv.py`, `shader_products.py`), the shared shader tools, profile,
 captures and translator. The new receipt format rebuilds existing ports once.
 
+Shader bundle export keeps validated SPIR-V modules in their translation files
+and loads at most one compression batch of `jobs` modules at a time. Each batch
+is written before the next is loaded; uncompressed export reads one module at
+a time. The sorted entry table and reflection remain in memory; payload memory
+depends on individual module sizes and the job count, rather than the aggregate
+SPIR-V. The private staged bundle is read back one module at a time before atomic
+publication. Version 1/2 layout, compression settings and byte comparison are
+unchanged.
+
 | Stage | What | Output (in `<game folder>/<title ID>_build/`) |
 |---|---|---|
 | inputs | Find the base game, updates and DLC (NSP / XCI / NSZ / XCZ files, regardless of extension case), match the profile, pick the version; check the game folder's drive has room (about twice the game files, NSZ / XCZ counted decompressed and once more for their NSP, less an earlier port's build folder) | |
@@ -251,6 +289,7 @@ captures and translator. The new receipt format rebuilds existing ports once.
 | system data | Only for a profile with `sysdata` and a `--firmware` folder (the player's own system content files, `.nca`): `nx_extract --sysdata` writes each title's RomFS; without the folder the port says so in red and the host's stand-in is used (for the font titles, the host's own stand-in fonts) | `sysdata/<title ID>/` |
 | 60 fps | Only with `--fps60` (below): the profile's own cap, or the build's FPSLocker-Warehouse config converted for the host | `android/fpslock/{fpslock.tsv,patches.py,<build ID>.yaml}` |
 | rewrite | `patch_nso.py` with `DM_TARGET=android` | `android/patched_<version>/` |
+| runtime GLSLC | When expected startup compiler outputs are missing, run the packed version's rewritten modules in a headless Android host before splitting; complete captures are reused without a device | `extract/<version>/glslc_capture/` |
 | shaders | `shader_split.py` (the DLC's own shaders too, `aoc/` given as `DM_SPLIT_AOC`), then `shader_vk.py` (SPIR-V, each module zstd-compressed in the bundle: 3.5x smaller, about 2 s more for the largest bundle; uncompressed in a Python without zstd) with the translator built from the repository's source (`dm/gfx/tools/dmsh_xlate` over `dm/third_party/ryujinx`, once per player in their nx2android folder), plus the shaders captured on the device (below) | `shader/pkg`, `android/shaders.dmsv`, `android/captured_shaders/` |
 | host | `dm/android/build.py --release` with the player's NDK (`--debug`: a development build, debug information and `DM_CTL`) | `android/host/libdmhost.so` (`android/host-debug/`) |
 | apk | `dm/android/apk/mkapk.py`, signed with the player's own key, with the game's gamepad theme only (`dm/android/themes/themes.tsv`: its pack, else the ergo pack) as `assets/overlay/`, and the overlay's font with its licenses (`dm/third_party/fusion-pixel-font`) as `assets/font/` | `<out>/<App>.apk` |
@@ -306,9 +345,11 @@ The app keeps the game's save in its internal storage (`$DM_SAVE`, and `<DM_SAVE
 
 An Android shader profile can set `android_dynamic_slots` to `on` in `game.tsv` to bind separate texture, sampler and texel buffer arrays from the driver slots (requires `tex_dyn_slots on`; FINAL FANTASY RESONANCE's Niagara particle parameters are texel buffer arrays). `android_subgroup_size` selects the translator's subgroup size; its default is 128. For a packed texture handle read directly from game memory, `android_shader_handles.tsv` gives the shader key, guest handle, replacement slot handle and expected number of sites. The shader builder applies these rules to the translated game shader and checks the site count. Paper Mario: The Thousand-Year Door uses this for the animated save block on Adreno 840.
 
-Shaders captured on the device: a game can set shaders whose code is in no game file (Xenoblade Chronicles 3, hundreds: effects and model materials), which the split cannot find. When a draw needs a shader the bundle lacks, the app saves it to `captured_shaders/<key>.bin` in its files folder (`gfx_vk_shader.c` `vk_shader_missing`; the draw is skipped this time). A port with `--install` first pulls that folder into `<build folder>/android/captured_shaders/`, which is kept from port to port, and `shader_vk.py --capture` translates it into the bundle. These shaders are not in the profile's tables: the tables stay what the game files give. So such a game draws everything only after it has been played that far once and ported again.
+Shaders captured on the device: a game can set shaders whose code is in no game file (Xenoblade Chronicles 3, hundreds: effects and model materials), which the split cannot find. When a draw needs a shader the bundle lacks, the app saves it to `captured_shaders/<key>.bin` in its files folder (`gfx_vk_shader.c` `vk_shader_missing`; the draw is skipped this time). A port on a PC that can reach the device over adb, with or without `--install`, first pulls that folder into `<build folder>/android/captured_shaders/`, which is kept from port to port, and `shader_vk.py --capture` translates it into the bundle. These shaders are not in the profile's tables: the tables stay what the game files give. So such a game draws everything only after it has been played that far once and ported again.
 
 Unity serialized resources can omit their type trees. The shader reader borrows an embedded tree of the same class and type hash, or uses an exact-hash layout in `dm/gfx/tools/unityfs.py`; it never selects a layout solely by the Unity version. The Unity 2020.3 ComputeShader fallback reads keyword-set `variantMap` entries, including built-in skinning and blend-shape kernels. These are package shaders, not runtime-only captures: rebuilding from the original game files supplies them without first playing the game. A missing-layout report is a reader coverage gap, not proof that the shader code is absent from the game files.
+
+The split maps a UnityFS bundle instead of reading it and unpacks one node at a time (`unityfs.bundle_nodes`), only the blocks that node covers. A node whose first 48 bytes are not a serialized-file header, such as a `.resS` of texture data, is never unpacked. A worker's memory is then about one serialized file, not the whole unpacked bundle: Ori and the Will of the Wisps' 822 MB `data_1.unity3d`, unpacked whole, ran a 6 GB phone out of memory even with `--jobs 1`.
 
 Captured compute code can be headerless: `shader_vk.py` uses the same control-section thread-group rule as `shader_split.py` to identify it. Compute translation jobs take local dimensions and shared-memory size from that control section before applying the profile's facts, so captures without a facts-table row do not silently become `1x1x1` kernels.
 
@@ -334,7 +375,7 @@ OpenGL ES games (FM24 Touch: NVIDIA's OpenGL driver in subsdk0, GLSL ES shaders 
 
 What the port refuses: a game whose `main` renders with Vulkan (the Android host replays NVN and runs OpenGL ES so far), and one whose shaders need a step upstream runs by booting the game in the Mac host (legacy Unreal paks, PlatinumGames' PKZ archives).
 
-**GLSLC capture on the device.** A game that compiles some shaders at run time with its own GLSLC (Fire Emblem: Three Houses: 9 built-in GLSL shaders at boot) has no file that holds their outputs. The port boots the game headless on the Android device before the split (`pipeline.device_glslc`): the host built as an executable, the rewritten modules and the RomFS go to `/data/local/tmp/nx2a-glslc`, the RomFS as its files up to 16 MB with empty files of the same size for the bigger ones (Three Houses compiles before it reads its archives: 0.7 of 11.5 GB), and the host runs with `DM_GLSLC_CAPTURE` (`dm/host/hle_glslc.c`) until every capture the profile's shader map names is there or 60 s pass. The captures are pulled into `<version dir>/glslc_capture`, where the split reads them, as the Mac's `capture_glslc` leaves them; their names are hashes of the outputs, so they match the profile's tables. So the port needs adb and the device even when it does not install.
+**Runtime GLSLC capture.** Games whose own compiler produces shaders at startup can capture them on Android before the offline split (`pipeline.device_glslc`). Missing outputs require adb and an ARM64 device even without `--install`. The RomFS staging retains small files and sparse stand-ins above 16 MiB, so startup compilation does not copy multi-gigabyte archives. A null-graphics host runs the packed version's code with fresh temporary saves and a device-side deadline; validated outputs replace the capture directory with rollback on publication failure. Complete profile-listed captures are reused without a device. Each missing shader-source version needs its own code, provisional profiles remain best effort, and compilers hosted in NROs are outside this preparation stage. This path does not establish that a game reaches its compiler or runs correctly on Android.
 
 **Oodle on the device.** Shaders that only the game's own Oodle decodes are decoded with that code on the Android device: the host built as an executable (`build.py --exe`) and the rewritten modules go to `/data/local/tmp/nx2a-oodle` once a port, each job file is decoded there (`dm/host/hle_oodle.c` `DM_OODLE_JOB`), and the folder is removed afterwards (`pipeline.device_oodle_job`). So the port needs adb and the device even when it does not install. Game Freak's GFPAKs and Trinity packs go as one job before the split (`device_oodle`). The returned result is indexed by file offset and length, then copied into the split's decoded archives in chunks of at most 1 MiB, without retaining whole payloads or concatenated archives in Python memory. Short headers, record lengths and payloads fail the stage before decoded archives are written. The temporary result is removed after copying and closing it. An IoStore shader library selects the Unreal decode stage even without a version 11 pak. Unreal Engine's shader code archives (version 11 paks, Unreal Engine 5's IoStore shader libraries) go in rounds (`device_ue`): `uepak.job` runs with a decoder that answers from what is decoded so far and notes the rest, the noted streams go to the device as one job, and the next round runs, until a round notes nothing (FINAL FANTASY RESONANCE: one round of 5,919 shader groups, 74,244 shaders in under a minute); the archives land in `<version dir>/ue_shaders` with the NSP script's stamp, where the split reads them, as the Mac's `decode_ue_shaders` leaves them.
 

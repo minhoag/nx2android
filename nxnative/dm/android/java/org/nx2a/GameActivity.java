@@ -2,7 +2,7 @@ package org.nx2a;
 
 import java.nio.charset.StandardCharsets;
 
-/** Optional Java text entry; the ordinary NativeActivity APK remains code-less. */
+/** Optional Java text entry layered on the mod import activity. */
 public class GameActivity extends ImportActivity {
     private final GameKeyboard keyboard = new GameKeyboard(this);
 

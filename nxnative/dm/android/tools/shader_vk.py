@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Android shader build: a game's Switch shaders (the package directory shader_split.py writes) → Vulkan SPIR-V + replay reflection, packed into one bundle.
 # The same translator as the Apple chain (dm/gfx/tools/dmsh_xlate_bin, Ryujinx's translator with TargetApi.Vulkan) and the same jobs as dmsh_build.py
-# (control section / code area / c1 split, the VertexA + VertexB merge, the profile's answer table), but no MSL: Vulkan takes the SPIR-V as it is.
+# (control section / code area / c1 split, the VertexA + VertexB merge, the profile's answer table), but no MSL: Vulkan receives SPIR-V with the existing parity offset and numeric passes.
 # Geometry shaders are translated as Vulkan geometry shaders (the Apple chain emulates them in compute kernels).
 #   DM_GAME=<id> shader_vk.py <package dir> <out bundle> [--jobs N] [--keys k1,k2] [--xlate <dmsh_xlate.dll>] [--capture <dir>] [--zstd <level>]
 # --capture: shaders whose code no game file holds, saved on the device by the Vulkan backend (gfx_vk_shader.c vk_shader_missing: <key>.bin = "DMSC", u32 control length, u32 code length,
@@ -14,7 +14,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path[:0] = [str(TOOLS), str(HERE)]
-import dmsh_facts, dmsh_chain, dmsv, shader_products   # noqa: E402  (DM_GAME picks the profile)
+import dmsh_facts, dmsh_chain, dmsv, shader_products, spv_half, spv_precise, spv_texture_offsets   # noqa: E402  (DM_GAME picks the profile)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
 ap = argparse.ArgumentParser()
@@ -488,22 +488,29 @@ def main():
             if k in failures: raise ValueError(failures[k])
             product = shader_products.output(w, k, STAGES[stages[k]])
             if product is None: raise ValueError(batch_errors[k] or 'no output')
-            spv, res = product
+            translated, res = product
+            spv = spv_precise.lower(spv_half.lower(spv_texture_offsets.lower(translated)))
             binds, local, io = spirv_bindings(spv)
             shader_products.validate_bindings(binds, res)
-            if k in handle_remaps:
-                spv = remap_handles(spv, *handle_remaps[k])
+            if k in handle_remaps: spv = remap_handles(spv, *handle_remaps[k])
+            # The bundle reads modules back from disk: a module the lowering passes or a handle remap changed gets its own file, or the translator's unlowered one would ship.
+            spv_path = Path(w) / f'{k}.spv'
+            if spv != translated:
+                spv_path = Path(w) / f'{k}.bundle.spv'; spv_path.write_bytes(spv)
             st = stages[k]
             cl = [classify(st, b, res) for b in binds]
             for e in cl: kinds_all[e['kind']] += 1
             # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
             hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
-            entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
+            entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv_path, refl_bin(cl, c1s[k], hdr3)))
         except Exception as e:
             reason = str(e)
             failed.append([f'{gs_var[k] if k in gs_var else int(k, 16):016x}', reason])
             fails[reason] += 1
             print(f'[RED] {failed[-1][0]}: {reason}', flush=True)
+    # The validated modules are already on disk. Do not retain their aggregate
+    # SPIR-V or the source packs/jobs while dmsv compresses bounded batches.
+    packs.clear(); jobs.clear(); c1s.clear(); cap.clear()
     if a.zstd: print(f'compressing {len(entries)} shaders (zstd level {a.zstd}, {a.jobs} threads) ...', flush=True)
     ver, raw, stored = dmsv.write(a.out, entries, level=a.zstd, jobs=a.jobs)
     if a.report:

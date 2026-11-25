@@ -9,11 +9,13 @@ import io
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -47,6 +49,7 @@ class ExportChecks(unittest.TestCase):
         self.report = self.root / 'report.json'; self.stage = 'cs'; self.calls = 0
         self.behavior = 'ok'; self.reflect = True; self.second_shader = False; self.bad_resource = None
         self.jobs = 1; self.bad_key = None; self.log = io.StringIO(); self.bindings = []
+        self.shader_count = 0; self.extra_spv = b''; self.spv_override = None
         (self.root / 'pkg').mkdir()
 
     def translate(self, argv, **kwargs):
@@ -60,7 +63,7 @@ class ExportChecks(unittest.TestCase):
             if broken and self.behavior in ('process-failed', 'crash-after-output'): bad += 1; continue
             if broken and self.behavior == 'second-missing' and job['attr']: bad += 1; continue
             key = job['key']
-            (dest / f'{key}.spv').write_bytes(b'bad module' if broken and self.behavior == 'bad-module' else module(self.stage))
+            (dest / f'{key}.spv').write_bytes(b'bad module' if broken and self.behavior == 'bad-module' else self.spv_override or module(self.stage) + self.extra_spv)
             if broken and self.behavior == 'failed-after-spv': bad += 1; continue
             if self.reflect or not broken: (dest / f'{key}.res.json').write_text(json.dumps(self.bad_resource if broken and self.bad_resource is not None else reflection(key, self.stage)))
         summary = f'translated: {len(jobs)-bad} ok, {bad} failed\n'
@@ -70,13 +73,17 @@ class ExportChecks(unittest.TestCase):
 
     def run_export(self):
         table = self.root / 'shader_map.tsv'
-        table.write_text(f'{self.stage}_test.bin\t0\t0\t0000000000000001\t0\n' +
-                         (f'{self.stage}_test.bin\t0\t0\t0000000000000002\t0\n' if self.second_shader else ''))
+        count = self.shader_count or (2 if self.second_shader else 1)
+        table.write_text(''.join(f'{self.stage}_test.bin\t0\t0\t{k:016x}\t0\n' for k in range(1, count + 1)))
         (self.root / 'pkg' / f'{self.stage}_test.bin').write_bytes(b'fixture')
         game = SimpleNamespace(table=lambda name: self.root / name)
         try: products = importlib.import_module('shader_products')
         except ModuleNotFoundError: products = None
-        env = dict(collections=collections, cf=cf, os=os, json=json, struct=struct,
+        numeric = {}
+        for name in ('spv_half', 'spv_precise', 'spv_texture_offsets'):
+            try: numeric[name] = importlib.import_module(name)
+            except ModuleNotFoundError: numeric[name] = None
+        env = dict(**numeric, collections=collections, cf=cf, os=os, json=json, struct=struct,
                    tempfile=tempfile, subprocess=subprocess, dmsv=dmsv, Path=Path, re=re,
                    shader_products=products, GAME=game, MAP=str(table), XLATE_DLL='translator.dll',
                    a=SimpleNamespace(pkg=str(self.root/'pkg'), out=str(self.out), capture=None, keys='',
@@ -89,10 +96,48 @@ class ExportChecks(unittest.TestCase):
                    refl_bin=lambda cl,c1,hdr: struct.pack('<5I', 0, 0, *hdr),
                    classify=lambda *args: None)
         source = TOOLS / 'shader_vk.py'; tree = ast.parse(source.read_text())
-        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main']
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('main', 'remap_handles')]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), env)
         with mock.patch.dict(os.environ, {'WORK': str(self.root)}), mock.patch.object(subprocess, 'run', side_effect=self.translate), contextlib.redirect_stdout(self.log):
             env['main']()
+
+    @unittest.skipUnless(shutil.which('spirv-as') and shutil.which('spirv-val'), 'requires NDK SPIR-V tools on PATH')
+    def test_exact_offsets_reach_published_bundle(self):
+        from test_shader_exact_offsets import ASSEMBLY
+        raw=subprocess.check_output(['spirv-as','--target-env','spv1.3','-o','-','-'],input=ASSEMBLY.encode())
+        with mock.patch(__name__ + '.module', return_value=raw): self.run_export()
+        with dmsv.Bundle(self.out) as bundle: exported=bytes(bundle.spv(bundle.entries[0]))
+        result=subprocess.run(['spirv-val','--target-env','vulkan1.1','-'],input=exported,capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+
+    def test_numeric_failure_omits_only_affected_shader(self):
+        self.second_shader = True
+        with mock.patch.object(importlib.import_module('spv_half'), 'lower', side_effect=[ValueError('unsupported half-pack signature'), module('cs')]):
+            self.run_export()
+        with dmsv.Bundle(self.out) as bundle:
+            self.assertEqual([e[0] for e in bundle.entries], [2])
+        report = json.loads(self.report.read_text())
+        self.assertEqual(report['failed'], [['0000000000000001', 'unsupported half-pack signature']])
+
+    @unittest.skipUnless(shutil.which('glslc'), 'requires NDK glslc on PATH')
+    def test_numeric_passes_reach_published_bundle(self):
+        source = b"""#version 450
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) buffer Data {vec2 a; float smallest; uint packed;} d;
+void main(){d.smallest=min(d.a.x,d.a.y);d.packed=packHalf2x16(d.a);}
+"""
+        raw = subprocess.check_output(['glslc', '-fshader-stage=compute', '--target-env=vulkan1.1', '-', '-o', '-'], input=source)
+        with mock.patch(__name__ + '.module', return_value=raw): self.run_export()
+        with dmsv.Bundle(self.out) as bundle: exported = bytes(bundle.spv(bundle.entries[0]))
+        def operations(data):
+            w=struct.unpack('<'+'I'*(len(data)//4),data); at=5; ops=[]
+            while at<len(w):
+                if w[at]&0xffff==12: ops.append(w[at+4])
+                at+=w[at]>>16
+            return ops
+        self.assertIn(37,operations(raw)); self.assertIn(58,operations(raw))
+        self.assertNotIn(37,operations(exported)); self.assertNotIn(58,operations(exported))
+        self.assertIn(79,operations(exported))
 
     def test_normal_per_shader_failure_keeps_best_effort_export(self):
         self.behavior = 'partial'; self.second_shader = True
@@ -171,6 +216,45 @@ class ExportChecks(unittest.TestCase):
         self.assertEqual(report['failed'], [])
         with dmsv.Bundle(str(self.out)) as b:
             self.assertEqual([(x[0], x[1]) for x in b.entries], [(1, 5)])
+
+    def test_export_does_not_retain_all_translated_modules(self):
+        # One 256 KiB OpSourceContinued per module: retaining all 64 products
+        # adds 16 MiB even with compression off and a single translation job.
+        self.shader_count = 64
+        self.extra_spv = struct.pack('<I', (65535 << 16) | 2) + bytes(65534 * 4)
+        tracemalloc.start()
+        try:
+            self.run_export()
+            _, peak = tracemalloc.get_traced_memory()
+        finally: tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024 * 1024, 'export retained the aggregate SPIR-V before writing')
+        with dmsv.Bundle(self.out) as b:
+            self.assertEqual(len(b.entries), 64)
+            self.assertEqual(b.spv(b.entries[-1]), module(self.stage) + self.extra_spv)
+
+    def test_file_backed_export_keeps_remapped_handles(self):
+        # The translated file must remain unchanged, but the bundle must contain
+        # the adjusted module, including both constants added by remap_handles.
+        w = list(struct.unpack(f'<{len(module("cs")) // 4}I', module('cs'))); w[3] = 32
+        at = w.index(5 << 16 | 54)
+        w[at:at] = [2 << 16 | 20, 7, 4 << 16 | 21, 8, 32, 0,
+                    4 << 16 | 32, 9, 7, 8,
+                    4 << 16 | 43, 8, 10, 20, 4 << 16 | 43, 8, 11, 0xfffff,
+                    4 << 16 | 43, 8, 12, 0x1234]
+        at = w.index(1 << 16 | 253)
+        w[at:at] = [4 << 16 | 59, 9, 13, 7, 3 << 16 | 62, 13, 12,
+                    4 << 16 | 61, 8, 14, 13,
+                    5 << 16 | 194, 8, 15, 14, 10, 5 << 16 | 199, 8, 16, 14, 11]
+        self.spv_override = struct.pack(f'<{len(w)}I', *w)
+        (self.root / 'android_shader_handles.tsv').write_text('0000000000000001 0x1234 0x5678 1\n')
+        self.run_export()
+        with dmsv.Bundle(self.out) as b:
+            spv = b.spv(b.entries[0])
+            self.assertIn(struct.pack('<4I', 4 << 16 | 43, 8, 32, 0x1234), spv)
+            self.assertIn(struct.pack('<4I', 4 << 16 | 43, 8, 33, 0x5678), spv)
+            self.assertEqual(struct.unpack_from('<I', spv, 12)[0], 36)
+        translated = next(self.root.glob('shvk_*/0000000000000001.spv'))
+        self.assertEqual(translated.read_bytes(), self.spv_override)
 
 
 class ProductValidation(unittest.TestCase):

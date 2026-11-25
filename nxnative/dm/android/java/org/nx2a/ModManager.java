@@ -18,7 +18,7 @@ import java.util.Arrays;
 import java.util.UUID;
 
 final class ModManager {
-    private static String title, applied = "";
+    private static String applied = "";
     private static boolean conflict;
 
     private static SharedPreferences state(Context c) { return c.getSharedPreferences("mod-selection", Context.MODE_PRIVATE); }
@@ -31,11 +31,8 @@ final class ModManager {
         for (File child : children) {
             if (!child.getCanonicalPath().equals(child.getAbsolutePath()) || child.getName().indexOf(':') >= 0) throw new IOException("Unsafe path in mod");
             if (!child.isDirectory()) continue;
-            if (child.getName().matches("(?i)[0-9a-f]{16}")) {
-                if (!child.getName().equalsIgnoreCase(title)) throw new IOException("Wrong or multiple title IDs");
-                File romfs = new File(child, "romfs");
-                if (!romfs.isDirectory()) throw new IOException("Missing romfs");
-                found.add(romfs);
+            if (child.getName().equals("romfs")) {
+                found.add(child);
             } else if (depth < 3) scan(child, depth + 1, found);
         }
     }
@@ -47,6 +44,13 @@ final class ModManager {
             for (File child : children) links(child);
         }
     }
+    static String validate(File dir) throws IOException {
+        ArrayList<File> found = new ArrayList<>();
+        scan(dir, 0, found);
+        if (found.size() != 1) throw new IOException("Expected one romfs folder");
+        links(dir);
+        return dir.toPath().relativize(found.get(0).toPath()).toString();
+    }
     private static File resolve(Context c, String id) throws IOException {
         try { if (!UUID.fromString(id).toString().equals(id)) throw new IllegalArgumentException(); }
         catch (IllegalArgumentException e) { throw new IOException("Invalid mod ID"); }
@@ -54,14 +58,16 @@ final class ModManager {
         File base = new File(external, "usermods"), dir = new File(base, id);
         if (!base.getCanonicalPath().equals(base.getAbsolutePath())) throw new IOException("Unsafe usermods directory");
         if (!dir.isDirectory() || !dir.getCanonicalPath().equals(dir.getAbsolutePath())) throw new IOException("Missing or unsafe mod");
-        ArrayList<File> found = new ArrayList<>();
-        scan(dir, 0, found);
-        if (found.size() != 1) throw new IOException("Expected one matching title and romfs");
-        links(found.get(0));
-        return found.get(0);
+        String relative = state(c).getString("path." + id, "");
+        if (relative.isEmpty()) throw new IOException("Mod not validated; reimport ZIP");
+        File romfs = new File(dir, relative);
+        if (!romfs.getCanonicalPath().equals(romfs.getAbsolutePath()) || !romfs.getCanonicalPath().startsWith(dir.getCanonicalPath() + File.separator)
+                || !romfs.getName().equals("romfs") || !romfs.isDirectory())
+            throw new IOException("Missing or unsafe mod RomFS; reimport ZIP");
+        return romfs;
     }
-    static String start(Activity a, String game, boolean hasOverlay) {
-        title = game; conflict = hasOverlay; applied = "";
+    static String start(Activity a, boolean hasOverlay) {
+        conflict = hasOverlay; applied = "";
         String selected = state(a).getString("selected", "");
         if (selected.isEmpty()) { Log.i("dmhost", "[mod] no mod selected; original RomFS"); return null; }
         if (conflict) { Log.e("dmhost", "[RED] [mod] existing DM_ROMFS_OVERLAY preserved; selected mod not applied"); return null; }
@@ -74,8 +80,11 @@ final class ModManager {
             return null;
         }
     }
-    static void name(Context c, String id, String name) { state(c).edit().putString("name." + id, name).apply(); }
-    static void open(Activity a) { a.runOnUiThread(() -> show(a)); }
+    static void name(Context c, String id, String name, String path) throws IOException {
+        if (!state(c).edit().putString("name." + id, name).putString("path." + id, path).commit())
+            throw new IOException("Cannot save mod metadata");
+    }
+    static void open(Activity a) { a.runOnUiThread(() -> { if (!a.isFinishing() && !a.isDestroyed()) show(a); }); }
     private static void show(Activity a) {
         File[] dirs = root(a).listFiles();
         ArrayList<String> ids = new ArrayList<>(), labels = new ArrayList<>(), errors = new ArrayList<>();

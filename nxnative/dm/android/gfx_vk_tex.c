@@ -304,24 +304,24 @@ int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t n
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n);
 static int sparse_tex(const tex_t *t) { return t->pool && nvn_sparse_pool(t->pool); }
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
-static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
+static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int track_writes);
 static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte words
     uint64_t h = 1469598103934665603ull; size_t i = 0;
     for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, m + i, 8); h = (h ^ w) * 1099511628211ull; }
     for (; i < n; i++) h = (h ^ m[i]) * 1099511628211ull;
     return h;
 }
-static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int track_writes) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
-    pkg_upload_(im, t, f);
+    pkg_upload_(im, t, f, track_writes);
     clock_gettime(CLOCK_MONOTONIC, &b); g_pkg_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); g_pkg_n++; g_pkg_bytes += t->L.size;
 }
-static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int track_writes) {
     { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 60) { n++;   // which packaged textures are (re-)uploaded
         VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d%s",
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
               (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
-    if (im->packaged < 100) im->packaged++;
+    if (track_writes && im->packaged < 100) im->packaged++;
     VkCommandBuffer cb = vk_upload_cmd();
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     const uint8_t *mem = t->mem; uint8_t *copy = NULL;
@@ -333,7 +333,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
         { static int n; const char *e = getenv("DM_VK_LOG_SPARSE"); if (e && atoi(e) && n < 400) { n++;   // which sparse textures are read, and how much of them was not mapped yet
             VKLOG("sparse upload: serial %llu %ux%ux%u format %#x levels %u flags %#x size %#llx mem %p pool %p tileH %u: %#llx bytes not mapped%s", (unsigned long long)t->serial, t->d.width, t->d.height,
                   t->d.depth, t->d.format, im->levels, t->d.flags, (unsigned long long)t->L.size, (const void *)t->mem, t->pool, t->L.tileH, (unsigned long long)miss, im->packaged > 1 ? " (again)" : ""); } }
-    } else {
+    } else if (track_writes) {
         nvn_dirty_protect(t->mem, t->L.size);
         im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
         im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0; im->pkg_hash = pkg_hash(t->mem, t->L.size);
@@ -359,6 +359,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     free(copy);
 }
 static int packaged_tex(const tex_t *t);
+enum { TEX_CONTENT_NONE, TEX_CONTENT_TRACKED, TEX_CONTENT_INITIAL };
 static int cpu_content_tex(const tex_t *t, const vkfmt_t *f);
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static void vk_tex_view_drop_all(vkimg_t *im);
@@ -392,7 +393,7 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
 static void img_drop(vkimg_t *im) { if (im->bc_draw) { vkimg_t *d = im->bc_draw; vk_lrz_forget(d); vk_tex_view_drop_all(d); if (d->sub) vk_defer_free_image_sub(d->img, d->sub); else vk_defer_free_image(d->img, d->mem); free(d); }
-    vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+    vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->full) vk_defer_free_view(im->full); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -434,13 +435,20 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
-    if (t->mem && lin_copy(im, t, f)) {}
-    else if (t->mem && (packaged_tex(t) || (first && (nvn_ft_written(t) || cpu_content_tex(t, f))))) {
+    if (t->mem && lin_copy(im, t, f)) return im;
+    int content = TEX_CONTENT_NONE;
+    if (t->mem) {
+        // A key hit can reuse a packaged image for another texture over the same storage. Refresh it only before GPU writes have made the image authoritative.
+        if (packaged_tex(t) || (im->packaged && !im->gpu_w) || (first && nvn_ft_written(t))) content = TEX_CONTENT_TRACKED;
+        else if (first) content = cpu_content_tex(t, f);
+    }
+    if (content == TEX_CONTENT_INITIAL) pkg_upload(im, t, f, 0);
+    else if (content == TEX_CONTENT_TRACKED) {
         im->pkg_used = g_tex_frame;
-        if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
+        if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f, 1); }
         else {
             uint64_t now = nvn_dirty_now();
-            if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
+            if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f, 1); }   // mapped or written since
             else if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) {   // pages written since the upload
                 // The GPU wrote the image since (a compute shader's image stores, a copy, a render) and its storage still holds the bytes of the upload: the writes were around
                 // it on shared pages, and an upload would put the CPU's bytes over the GPU's. Monster Hunter Rise's spot light profiles (512x1x64 R16F, written by a compute
@@ -448,7 +456,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
                 // those lights (the character maker, cutscenes) came out black. A sparse texture has no memory at t->mem to hash (it takes the branch above)
                 if (im->gpu_w && pkg_hash(t->mem, t->L.size) == im->pkg_hash) { nvn_dirty_protect(t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_released = 0;
                     static int nl; if (nl++ < 16) VKLOG("texture %ux%u nvn format %#x at %p: its pages were written, its bytes are as uploaded and the GPU wrote it: kept", t->d.width, t->d.height, t->d.format, (const void *)t->mem); }
-                else pkg_upload(im, t, f);
+                else pkg_upload(im, t, f, 1);
             }
             im->pkg_seen = now;
         }
@@ -549,7 +557,7 @@ static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = th
 // fields, 10x10x10 RGBA8 and RGBA16F, flags 0; as GPU textures of zeros every send-off particle moved along (-1, -1, -1)). It is made CPU-written: uploaded now, again when its pages
 // change. The compressed case was missing here: Xenoblade Chronicles 3's particle sprites (the husks' 128x128 BC7 sRGB, flags 0) were images of zeros, so the particle
 // pixel shader read alpha 0 and discarded every pixel (no red husk particles, no send-off ones). A pool the CPU cannot access is filled from its storage once in the same way, as the
-// Mac's tex_init_fill does (the game cannot write it again). DM_NVN_STORAGE_FIRST_USE=0 turns this off
+// Mac's tex_init_fill does (the game cannot write it again). DM_NVN_STORAGE_FIRST_USE=0 turns this off.
 static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-zero (stops at the first)
     uint64_t i = 0, v;
     for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; }
@@ -576,21 +584,35 @@ static int cpu_content_tex(const tex_t *t, const vkfmt_t *f) {
     // profile's tex_cpu_uncached it does not leave such a texture out: Cardfight!! Vanguard Dear Days 2 sets the flag on every texture and copies its BC7 font arrays
     // (1024x1024, 4 to 18 layers) into CPU-uncached pools with no flush; left out, they were images of zeros and no text was drawn anywhere
     if (t->d.flags & ((DM_GAME_TEX_CPU_UNCACHED && f->compressed ? 0 : NVN_TEXTURE_FLAGS_COMPRESSIBLE) | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) return 0;
-    // IMAGE (a render target or storage image) does not exclude a compressed texture: BC and ASTC are neither, so its bytes at first use are the CPU's.
-    if (!f->compressed && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE)) return 0;
+    int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0;
+    int initial_only = 0;
+    if (!f->compressed && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE)) {
+        if (!no_cpu || t->d.target != NVN_TEXTURE_TARGET_2D) return 0;
+        // Luigi's Mansion 3 binds prefilled R8 and RGB9E5 atlases this way. Profiles
+        // can seed these images once, without treating their storage as CPU-writable.
+        static int enabled = -1;
+        if (enabled < 0) { const char *e = getenv("DM_NVN_CPU_NO_ACCESS_IMAGE_FIRST_USE"); enabled = e && atoi(e) != 0; }
+        if (!enabled) return 0;
+        initial_only = 1;
+    }
     // CPU-filled 2D tables need the same first upload as compressed/3D textures. NieR's
     // 256x16 RGBA8 LUT had 16,384 nonzero storage bytes but an all-black GPU image; its
     // final colour pass consequently erased an otherwise correct title image.
-    // Off unless the profile sets DM_NVN_CPU_TEX2D_FIRST_USE=1: the alias walk and a wrong upload over render-target content stay out of other games.
+    // CPU-accessible 2D storage has its own opt-in and uses the tracked upload path.
     static int tex2d = -1; if (tex2d < 0) { const char *e = getenv("DM_NVN_CPU_TEX2D_FIRST_USE"); tex2d = e && atoi(e) != 0; }
-    if (!f->compressed && t->d.target != 2 && !tex2d) return 0;
     if (!f->compressed && t->d.target != 2 &&
-        (f->depth || f->stencil || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+        ((!initial_only && (!tex2d || no_cpu)) || f->depth || f->stencil ||
          (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) || cpu_storage_gpu_written(t))) return 0;
     if (!mem_any(t->mem, t->L.size)) return 0;
+    if (initial_only) {
+        static int n;
+        if (n++ < 16) VKLOG("texture %ux%u nvn format %#x at pool %p+%#llx: initial IMAGE data uploaded from CPU_NO_ACCESS storage",
+                            t->d.width, t->d.height, t->d.format, (const void *)t->pool, (unsigned long long)t->off);
+        return TEX_CONTENT_INITIAL;
+    }
     static int n; if (n++ < 8) VKLOG("texture %ux%ux%u nvn format %#x at %p (pool flags %#x): the CPU filled it before its first use: uploaded from its storage", t->d.width, t->d.height, t->d.depth, t->d.format, (const void *)t->mem, t->pool->flags);
     mtl_tex_cpu_written(t);
-    return 1;
+    return TEX_CONTENT_TRACKED;
 }
 static int packaged_tex(const tex_t *t) {
     if (t->has_layout || linear_tex(t) || sparse_tex(t)) return 1;
@@ -1008,12 +1030,33 @@ void vk_tbuf_drop_pool(uint64_t serial) {
         for (int j = 0; j < nv; j++) vk_defer_free_bview(vs[j]);
     }
 }
+unsigned g_tbuf_copies;   // views over a per-bind copy in scratch memory (gfx_vk_exec.c stage_set: such a stage is not kept for later draws, rmemo)
 VkBufferView vk_tbuf_view(const tex_t *t, int storage) {
     // keyed by the pool too: a pool finalized and another made at the same address has a new VkBuffer, and the old one's memory is freed once the GPU is past it. Keyed by address
     // alone, the view over the old buffer was handed out again and shaders read and wrote freed memory, which the kernel gives to newer buffers (Xenoblade Chronicles 3: the
     // allocator kept inside one of its memory pools had its tree bins overwritten during the opening movie, and malloc crashed at the next scene)
-    vkpool_t *pl = t->mem ? vk_pool_of((uint64_t)(uintptr_t)t->mem, 1) : NULL;
-    tbkey k = {(uint64_t)(uintptr_t)t->mem, pl ? pl->serial : 0, (uint32_t)t->d.format, t->d.width};
+    uint64_t addr = (uint64_t)(uintptr_t)t->mem;
+    vkpool_t *pl = t->mem ? vk_pool_of(addr, 1) : NULL;
+    if (!pl) {
+        const vkfmt_t *f = vk_fmt(t->d.format);
+        VkDeviceSize n = f && f->bpb ? (VkDeviceSize)t->d.width * f->bpb : 0;
+        // the whole copy, not one byte: past the virtual pool vk_ubd_read would fall back to a plain memcpy of the reserved (no-access) range
+        if (t->mem && n && nvn_sparse_address_pool(addr, n)) {
+            if (storage) return vk_dummy_tbuf(storage);   // a sparse pool's physical buffer can go away; never cache a view over it
+            VkDeviceSize so; VkBuffer b;
+            VkDeviceSize al = V.props.limits.minTexelBufferOffsetAlignment;
+            VkDeviceSize eu = V.tbuf_align_uniform ? V.tbuf_align_uniform : al;
+            VkDeviceSize es = V.tbuf_align_storage ? V.tbuf_align_storage : al;
+            VkDeviceSize sa = al; if (eu > sa) sa = eu; if (es > sa) sa = es;
+            uint8_t *p = vk_scratch(n, sa, &b, &so); void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(addr, n, p);
+            VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, b, f->vk, so, n}; VkBufferView v = VK_NULL_HANDLE;
+            if (!vkCreateBufferView(V.dev, &ci, NULL, &v)) vk_defer_free_bview(v);
+            return v;   // the per-bind copy is not cached: no live guest pool owns this view
+        }
+        if (t->mem) VKRED_ONCE(16, "buffer texture not in a pool (format %#x, %u elements)", t->d.format, t->d.width);
+        return vk_dummy_tbuf(storage);
+    }
+    tbkey k = {addr, pl->serial, (uint32_t)t->d.format, t->d.width};
     pthread_mutex_lock(&g_tbuf_mu);
     VkBufferView v = nvn_hm_get(&g_tbuf_cache, &k);
     if (!v) {
@@ -1049,7 +1092,7 @@ VkBufferView vk_tbuf_view(const tex_t *t, int storage) {
             VkDeviceSize n = (VkDeviceSize)t->d.width * f->bpb, so; VkBuffer sb; void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst);
             uint8_t *p = vk_scratch(n, sa, &sb, &so); vk_ubd_read((uint64_t)(uintptr_t)t->mem, n, p);
             VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, sb, f->vk, so, n};
-            if (vkCreateBufferView(V.dev, &ci, NULL, &v)) v = VK_NULL_HANDLE; else vk_defer_free_bview(v);
+            if (vkCreateBufferView(V.dev, &ci, NULL, &v)) v = VK_NULL_HANDLE; else { vk_defer_free_bview(v); g_tbuf_copies++; }
             static unsigned nc; if (nc++ < 4) VKLOG("buffer texture at a misaligned offset (%llu, not a multiple of %llu; format %#x, %u elements): read from a copy", (unsigned long long)off, (unsigned long long)sa, t->d.format, t->d.width);
             pthread_mutex_unlock(&g_tbuf_mu); return v;   // (not cached: a copy of this bind's bytes)
         } else if (!v && in) VKRED_ONCE(16, "storage buffer texture at a misaligned offset: %llu, not a multiple of %llu (format %#x, %u elements): zeros", (unsigned long long)off, (unsigned long long)sa, t->d.format, t->d.width);

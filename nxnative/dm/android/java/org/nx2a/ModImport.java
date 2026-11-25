@@ -42,6 +42,7 @@ final class ModImport {
     static void detach(Activity a) { if (activity.get() == a) activity.clear(); }
     static void open(Activity a) {
         a.runOnUiThread(() -> {
+            if (a.isFinishing() || a.isDestroyed()) return;
             if (busy) {
                 new AlertDialog.Builder(a).setMessage("A mod import is already in progress.").setPositiveButton("OK", null).show();
                 return;
@@ -74,7 +75,8 @@ final class ModImport {
         if (a != null) attach(a);
     }
     private static String extract(Context context, Uri uri) throws IOException {
-        File root = new File(context.getExternalFilesDir(null), "usermods");
+        File root = new File(context.getExternalFilesDir(null).getCanonicalFile(), "usermods");
+        if (!root.getCanonicalPath().equals(root.getAbsolutePath())) throw new IOException("Unsafe usermods directory");
         if (!root.isDirectory() && !root.mkdirs()) throw new IOException("Cannot create usermods directory");
         String id = UUID.randomUUID().toString();
         String displayName = "Mod " + id.substring(0, 8);
@@ -83,7 +85,7 @@ final class ModImport {
         }
         File stage = new File(root, "." + id + ".part"), destination = new File(root, id);
         if (!stage.mkdir()) throw new IOException("Cannot create staging directory");
-        boolean published = false;
+        boolean published = false, renamed = false;
         try {
             String prefix = stage.getCanonicalPath() + File.separator;
             HashMap<String, Boolean> paths = new HashMap<>();
@@ -144,12 +146,14 @@ final class ModImport {
                 }
             }
             if (count == 0) throw new IOException("ZIP contains no entries");
+            String relative = ModManager.validate(stage);
             if (destination.exists() || !stage.renameTo(destination)) throw new IOException("Cannot publish import");
+            renamed = true;
+            ModManager.name(context, id, displayName, relative);
             published = true;
-            ModManager.name(context, id, displayName);
             return destination.getAbsolutePath();
         } finally {
-            if (!published) remove(stage);
+            if (!published) { remove(stage); if (renamed) remove(destination); }
         }
     }
     private static void remove(File file) {

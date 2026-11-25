@@ -39,10 +39,12 @@ class OverlayVisibility(unittest.TestCase):
 #include "stick_axis.h"
 static _Atomic int g_set_overlay, g_overlay, g_pads, g_edit, g_menu_btn = 1;
 static _Atomic int g_cust[2][2][OV_N][4];
-static _Atomic int g_set_rumble, g_set_fps, g_set_labels, g_menu_tab, g_sv_st;
+static _Atomic int g_set_rumble, g_set_fps, g_set_sr, g_set_labels, g_menu_tab, g_sv_st;
 static int layout, saves;
 int dm_overlay_layout(void) { return layout; }
 float dm_overlay_scale(void) { return 1; }
+int dm_external_active(void) { return 0; }
+int dm_overlay_dpi(void) { return 0; }
 int dm_overlay_custom(int l, int c, float *x, float *y, float *s) {
     (void)l; (void)c; (void)x; (void)y; *s = 1; return 0;
 }
@@ -57,7 +59,8 @@ static int fps_opt_press(int item) { (void)item; return 0; }
 static void ed_open(void) {}
 static void sp_open(void) {}
 static void save_export(void) {}
-static void menu_audio(void) {}
+static int g_audio_menu_method = 1, g_mod_menu_method = 2, g_mod_manage_method = 3, java_action;
+static void menu_java(int method, const char *action) { (void)action; java_action = method; }
 static void menu_close(void) {}
 static void dm_overlay_redraw(void) {}
 ''' + visible + hidden + hit + menu + r'''
@@ -408,6 +411,9 @@ int main(int argc, char **argv) {
             assert(saves == 1 && dm_overlay_visible() == 1); controls(1);
             menu_do(OVM_OVERLAY);
             assert(saves == 2 && dm_overlay_visible() == 2); controls(0);
+            menu_do(OVM_AUDIO); assert(java_action == 1);
+            menu_do(OVM_MOD_IMPORT); assert(java_action == 2);
+            menu_do(OVM_MOD_MANAGE); assert(java_action == 3);
         }
     }
     return 0;

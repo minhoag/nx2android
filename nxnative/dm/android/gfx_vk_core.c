@@ -411,6 +411,47 @@ static int recv_fds(int sock, int *fds, int max) {
             for (size_t i = 0; i < (c->cmsg_len - CMSG_LEN(0)) / sizeof(int) && n < max; i++) fds[n++] = ((int *)CMSG_DATA(c))[i];
     return n;
 }
+// Extract the mappable dma-buf fd from an AHardwareBuffer's native handle. Adreno sends 1 fd; MediaTek gralloc_extra sends 3 (metadata at 0, dma-buf at 1).
+static int ahb_fd(AHardwareBuffer *ahb, int *why) {
+    int sv[2], fds[16], nfd = -1;
+    if (why) *why = 4;   // the caller's diagnostic stage: 2 socketpair, 3 the handle never arrived, 4 nothing usable came back
+    if (!ahb || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { if (why) *why = 2; return -1; }
+    if (!AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
+    else if (why) *why = 3;
+    close(sv[0]); close(sv[1]);
+    if (nfd < 1) return -1;   // (still 4: the receive brought nothing back)
+    int pick = -1;
+    if (nfd == 1) {
+        pick = 0;
+    } else {
+        int first = -1;   // a dma-buf names itself: prefer it to another mappable fd (an ashmem region also maps read-write on some grallocs)
+        for (int i = 0; i < nfd; i++) {
+            void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fds[i], 0);
+            if (p == MAP_FAILED) continue;
+            munmap(p, 4096);
+            if (first < 0) first = i;
+            char link[64], tgt[128] = "";
+            snprintf(link, sizeof link, "/proc/self/fd/%d", fds[i]);
+            ssize_t r = readlink(link, tgt, sizeof tgt - 1);
+            if (r > 0) { tgt[r] = 0; if (strstr(tgt, "dmabuf") || strstr(tgt, "gralloc")) { pick = i; break; } }
+        }
+        if (pick < 0) pick = first;
+    }
+    if (pick >= 0) {
+        static int said;
+        if (!said) {
+            said = 1;
+            char link[64], target[128] = "?";
+            snprintf(link, sizeof link, "/proc/self/fd/%d", fds[pick]);
+            ssize_t r = readlink(link, target, sizeof target - 1);
+            if (r > 0) target[r] = 0;
+            VKLOG("hardware buffer handle (%d fd%s): selected fd[%d] (%s)", nfd, nfd == 1 ? "" : "s", pick, target);
+        }
+    }
+    int chosen = pick >= 0 ? fds[pick] : -1;
+    for (int i = 0; i < nfd; i++) if (i != pick) close(fds[i]);
+    return chosen;
+}
 static const VkBufferUsageFlags POOL_USAGE0 = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
     VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
@@ -508,12 +549,7 @@ static slab_t *slab_new(int c) {   // a slab of class c, allocated and imported 
     s->slot_bytes = sb; s->nslot = s->nfree = n; s->fd = -1;
     AHardwareBuffer_Desc d = {(uint32_t)size, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
     if (AHardwareBuffer_allocate(&d, &s->ahb)) { free(s); return NULL; }
-    int sv[2], fds[16], nfd = -1;
-    if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) {
-        if (!AHardwareBuffer_sendHandleToUnixSocket(s->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
-        close(sv[0]); close(sv[1]);
-    }
-    if (nfd >= 1) { s->fd = fds[0]; for (int i = 1; i < nfd; i++) close(fds[i]); }
+    s->fd = ahb_fd(s->ahb, NULL);
     s->map = s->fd >= 0 ? mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0) : MAP_FAILED;
     VkAndroidHardwareBufferPropertiesANDROID ap = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
     VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
@@ -643,19 +679,15 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size, int lazy, co
     AHardwareBuffer *ahb = reuse ? re.ahb : NULL; int ar = reuse ? 0 : AHardwareBuffer_allocate(&d, &ahb);
     if (ar) { mem_diag_zc(1, "AHardwareBuffer_allocate", size, "return", ar); return -1; }
 #define ZC_DROP() do { if (reuse) zcf_free_now(&re); else AHardwareBuffer_release(ahb); } while (0)
-    int sv[2]; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) {
-        mem_diag_zc(2, "socketpair", size, "errno", errno); ZC_DROP(); return -1; }
-    int fds[16], nfd = -1;
-    ar = AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0]);
-    if (!ar) { nfd = recv_fds(sv[1], fds, 16); if (nfd < 1) mem_diag_zc(4, "recv_fds", size, "return", nfd); }
-    else mem_diag_zc(3, "AHardwareBuffer_sendHandleToUnixSocket", size, "return", ar);
-    close(sv[0]); close(sv[1]);
-    if (nfd < 1) { ZC_DROP(); return -1; }
+    int why = 4; int fd = ahb_fd(ahb, &why);
+    if (fd < 0) {   // the stage says which step of ahb_fd it was, and the name says the same: 2 socketpair, 3 the handle never arrived, 4 nothing usable came back
+        static const char *const stage_name[] = {"ahb_fd", "ahb_fd", "socketpair", "AHardwareBuffer_sendHandleToUnixSocket", "recv_fds"};
+        mem_diag_zc(why, why >= 0 && why < 5 ? stage_name[why] : "ahb_fd", size, "return", fd); ZC_DROP(); return -1; }
     // copy the pool's current contents into the buffer through a temporary mapping, then put the buffer's pages at the pool's address
-    zcfill_t f = {fds[0], 0, NULL, 0, in}; int rc = zc_place(mem, size, &f, lazy, &done);
+    zcfill_t f = {fd, 0, NULL, 0, in}; int rc = zc_place(mem, size, &f, lazy, &done);
     if (rc == -5) mem_diag_zc(5, "mmap-temporary", size, "errno", errno);
     else if (rc == -6) mem_diag_zc(6, "mmap-fixed", size, "errno", errno);
-    for (int i = 0; i < nfd; i++) close(fds[i]);
+    close(fd);
     if (rc) { p->left = zc_unplace(mem, done, lazy, in); ZC_DROP(); return rc == 1 || rc == 2 ? rc : -1; }   // (a slice swapped before the failing one goes back first)
 #undef ZC_DROP
     if (reuse) { p->buf = re.buf; p->mem = re.mem; p->ahb = ahb; p->zero_copy = 1; return 0; }   // imported already
@@ -695,12 +727,9 @@ static int pool_fd(const vkpool_t *p, int *own) {
     *own = 0;
     if (!p->zero_copy) return -1;
     if (p->slab) return ((slab_t *)p->slab)->fd;
-    int sv[2], fds[16], nfd = -1; if (!p->ahb || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) return -1;
-    if (!AHardwareBuffer_sendHandleToUnixSocket(p->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
-    close(sv[0]); close(sv[1]);
-    for (int k = 1; k < nfd; k++) close(fds[k]);
-    if (nfd < 1) return -1;
-    *own = 1; return fds[0];
+    int fd = ahb_fd(p->ahb, NULL);
+    if (fd < 0) return -1;
+    *own = 1; return fd;
 }
 // A zero-copy pool's dma-buf mapped again over [mem, mem+len) in one piece per chunk, read-only (nvn_dirty_defrag: the mappings its protection split never merge), but for
 // the pools inside it, whose pages stay their own. 0 = done; 1 = nothing mapped (no pool is exactly [mem, mem+len): a pool not whole host pages, whose tracked range is
@@ -760,6 +789,32 @@ static void pool_copy_back(vkpool_t *p) {
 // (vendor.qti.hardware.display.allocator-service, snapalloc) aborts on a BLOB of 812 MB ("ubsan: mul-overflow" in SnapConstraintManager::AlignmentToAlignedConstraints),
 // and the whole Android UI restarts with it; 400 MB ones work (13 Sentinels: Aegis Rim's 0x32c00000-byte pool). A range across two chunks has no buffer (vk_pool_of)
 #define ZC_CHUNK 0x10000000ull
+// A gralloc may refuse a BLOB of exactly ZC_CHUNK bytes: an OPPO Pad on Android 15 answers AHardwareBuffer_allocate with 3 (bad value) for 256 MB, so every 256 MB pool
+// fell back to the copied path (768 MB of GPU copies before each submission, 2 fps). The chunk is therefore probed once, before the first pool: ZC_CHUNK if this gralloc
+// takes it, else half of it, and so on down to 32 MB. A device that takes ZC_CHUNK is unchanged; one that refuses it gets its pools cut evenly instead of copied.
+// DM_VK_ZC_CHUNK_MB=<n> sets the chunk in MB and skips the probe
+static uint64_t zc_probe(uint64_t size) {   // asks the gralloc for a BLOB of that size, and gives it back
+    AHardwareBuffer_Desc d = {(uint32_t)size, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB,
+        AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
+    AHardwareBuffer *b = NULL;
+    if (size > 0xffffffffull || AHardwareBuffer_allocate(&d, &b)) return 0;
+    AHardwareBuffer_release(b);
+    return size;
+}
+static uint64_t zc_chunk_work_out(void) {   // the probe itself: a hardware buffer per size tried, on the thread that first needs it
+    const char *e = getenv("DM_VK_ZC_CHUNK_MB"); long mb = e ? atol(e) : 0;
+    if (mb > 0) return (uint64_t)mb << 20;   // (asked for by hand: no probe, no line)
+    uint64_t v = ZC_CHUNK;
+    for (; v > (1ull << 25) && !zc_probe(v); v /= 2) { }
+    if (v != ZC_CHUNK) LOG("[vk] this gralloc refuses %llu MB: memory pools are cut into %llu MB chunks", (unsigned long long)(ZC_CHUNK >> 20), (unsigned long long)(v >> 20));
+    return v;
+}
+static uint64_t zc_chunk(void) {
+    static uint64_t v;   // (0: not worked out yet; stored once it is, so another thread adding a pool sees ZC_CHUNK or the answer, never a half-way value)
+    uint64_t got = __atomic_load_n(&v, __ATOMIC_ACQUIRE);
+    if (!got) __atomic_store_n(&v, got = zc_chunk_work_out(), __ATOMIC_RELEASE);
+    return got;
+}
 static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end, int lazy);
 static uint64_t g_zc_bytes, g_cp_bytes, g_lazy_total, g_lazy_bytes, g_used_bytes;   // made zero-copy, copied, made lazy, lazy ones given their buffer, found by vk_pool_of so far (DM_VK_MEMLOG; removed pools are not taken off)
 // Lazy pools: a pool's buffer is made only when the GPU first uses it (vk_pool_of, pool_back), through the slabs and kept buffers as at creation; until then its pages stay
@@ -794,10 +849,9 @@ static int zc_uncached(void) {
     enum { N = 1 << 20 }; v = 0;
     AHardwareBuffer_Desc d = {N, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
     AHardwareBuffer *ahb = NULL; if (AHardwareBuffer_allocate(&d, &ahb)) return v;
-    int sv[2], fds[16], nfd = -1;
-    if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { if (!AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16); close(sv[0]); close(sv[1]); }
-    uint8_t *a = nfd >= 1 ? mmap(NULL, N, PROT_READ | PROT_WRITE, MAP_SHARED, fds[0], 0) : MAP_FAILED, *m = malloc(N);
-    for (int i = 0; i < nfd; i++) close(fds[i]);
+    int fd = ahb_fd(ahb, NULL);
+    uint8_t *a = fd >= 0 ? mmap(NULL, N, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED, *m = malloc(N);
+    if (fd >= 0) close(fd);
     if (a != MAP_FAILED && m) {
         memset(a, 1, N); memset(m, 1, N);
         uint64_t ta = read_ns(a, N), tm = read_ns(m, N); v = ta > 4 * tm;
@@ -816,7 +870,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     vk_init();
     if (!size) return;
     uint64_t a = (uint64_t)(uintptr_t)mem; int whole = ((a | size) & 0xfff) || zc_over(size);   // copied in one piece
-    uint64_t c = whole ? size : ZC_CHUNK; int m = zc_lazy_mode();
+    uint64_t c = whole ? size : !zc_off() && size >= ZC_CHUNK ? zc_chunk() : ZC_CHUNK; int m = zc_lazy_mode();   // (the probe only where a pool is actually cut: not with zero copy off, nor for pools that never reach ZC_CHUNK)
     static uint64_t pg; if (!pg) pg = (uint64_t)getpagesize();   // (a 16 KB-page kernel: a pool only 4 KB-aligned is not swapped in place, it is copied as before)
     // (zero copy off: no lazy pools, and no uncached-read check either)
     int lazy = !whole && !zc_off() && !((a | size) & (pg - 1)) && m && (m >= 2 || (size > c ? m == 1 : zc_uncached())) && nvn_dirty_tracked(mem, size);
@@ -1024,13 +1078,16 @@ again:   // (pool_back found another pool in the entry: the one looked up was re
     else if (lazy) { int b = pool_back(r, serial); if (b > 0) goto again; if (b) r = NULL; }
     if (r && back && !__atomic_load_n(&r->used, __ATOMIC_RELAXED) && !__atomic_exchange_n(&r->used, 1, __ATOMIC_RELAXED)) __atomic_fetch_add(&g_used_bytes, r->hi - r->lo, __ATOMIC_RELAXED);
     if (r) { if (c.gen != g) { memset(&c, 0, sizeof c); c.gen = g; } c.p[ck] = r; memmove(&c.last[1], &c.last[0], 3 * sizeof *c.last); c.last[0] = r; }
-    if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
+    if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (DM_VK_ZC_CHUNK_MB; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
     return r;
 }
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) { return pool_find(addr, len, 1); }
 uint32_t vk_pool_gen(void) { return __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE); }   // pools added or removed (gfx_vk_exec.c's descriptor set memo: vk_pool_of's results hold while it is unchanged)
 int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
-    vkpool_t *p = vk_pool_of(addr, len ? len : 1);
+    if (!len) len = 1;
+    if (len > UINT64_MAX - addr) return 0;
+    vkpool_t *p = vk_pool_of(addr, len);
+    if (!p) { uint64_t physical; if (nvn_sparse_address_translate(addr, len, &physical)) { p = vk_pool_of(physical, len); if (p) addr = physical; } }
     if (!p) return 0;
     *buf = p->buf; *off = addr - p->lo + p->boff; return 1;
 }
@@ -1597,8 +1654,13 @@ void vk_ubd_land(VkCommandBuffer cb) {   // outside a render pass
         g_infl[g_ninfl++] = (ubd_infl_t){g_ubd[i].lo, g_ubd[i].hi, g_fence + 1, g_ubd[i].p, g_ubd[i].own};   // the fence of the submission being recorded; the heap copy goes with it
     }
     vk_img_barrier_all(cb);
-    for (int i = 0; i < g_nubd; i++) { VkBuffer db; VkDeviceSize dof; if (vk_buf_at(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo, &db, &dof)) {
-        VkBufferCopy r = {g_ubd[i].so, dof, g_ubd[i].hi - g_ubd[i].lo}; vkCmdCopyBuffer(cb, g_ubd[i].sb, db, 1, &r); sub_gpu_wrote(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo); } }
+    for (int i = 0; i < g_nubd; i++) {
+        uint64_t dst = g_ubd[i].lo, n = g_ubd[i].hi - dst; VkBuffer db; VkDeviceSize dof;
+        if (nvn_sparse_address_pool(dst, n) && !nvn_sparse_address_translate(dst, n, &dst)) { vk_readback_unknown(); continue; }
+        if (vk_buf_at(dst, n, &db, &dof)) {
+            VkBufferCopy r = {g_ubd[i].so, dof, n}; vkCmdCopyBuffer(cb, g_ubd[i].sb, db, 1, &r); sub_gpu_wrote(dst, n);
+        }
+    }
     vk_img_barrier_all(cb);
     g_ubd_landed += (uint64_t)g_nubd; g_nubd = 0; g_ubd_gen++;
 }
@@ -1615,8 +1677,15 @@ static void sub_gpu_wrote(uint64_t a, uint64_t n) {   // into the open submissio
     if (best >= 0 && (bd <= 65536 || s->ngw == GW_SUB)) { if (lo < s->gw[best].lo) s->gw[best].lo = lo; if (hi > s->gw[best].hi) s->gw[best].hi = hi; }
     else { s->gw[s->ngw].lo = lo; s->gw[s->ngw].hi = hi; s->ngw++; }
 }
+static int gpu_physical_range(uint64_t *a, uint64_t n) {
+    if (!nvn_sparse_address_pool(*a, n)) return 1;
+    uint64_t physical;
+    if (!nvn_sparse_address_translate(*a, n, &physical)) return 0;
+    *a = physical; return 1;
+}
 void vk_gpu_wrote(uint64_t a, uint64_t n) {
     if (!n || a > UINT64_MAX - n) return;
+    if (!gpu_physical_range(&a, n)) { vk_readback_unknown(); return; }   // a fragmented sparse write cannot be narrowed to one physical interval
     uint64_t f = g_fence + 1;
     for (size_t i = g_ngw; i-- > 0 && g_gw[i].fence == f;) if (g_gw[i].lo <= a && a + n <= g_gw[i].hi) return;
     if (g_ngw == g_cgw) {
@@ -1637,8 +1706,13 @@ void vk_gpu_wrote(uint64_t a, uint64_t n) {
     sub_gpu_wrote(a, n);
 }
 int vk_gpu_pending(uint64_t a, uint64_t n) {
-    if (!g_ngw) return 0;
+    if (!n || a > UINT64_MAX - n || !g_ngw) return 0;
+    int mapped = gpu_physical_range(&a, n);
     uint64_t done = vk_fence_done();
+    if (!mapped) {   // a fragmented sparse read can overlap any mapped physical run
+        for (size_t i = g_ngw; i-- > 0 && g_gw[i].fence > done;) return 1;
+        return 0;
+    }
     for (size_t i = g_ngw; i-- > 0 && g_gw[i].fence > done;) if (g_gw[i].lo < a + n && a < g_gw[i].hi) return 1;
     return 0;
 }
@@ -1650,7 +1724,18 @@ int vk_gpu_pending(uint64_t a, uint64_t n) {
 // already-landed updates conservatively retain the GPU wait on this backend.
 void vk_cpu_ready(uint64_t a, uint64_t n) {
     if (!g_vk_cpu_ready || !n || a > UINT64_MAX - n) return;
+    uint64_t guest_a = a;
+    int mapped = gpu_physical_range(&a, n);
     uint64_t done = vk_fence_done();
+    if (!mapped) {   // a fragmented sparse read cannot be narrowed to one physical interval; wait conservatively
+        for (size_t i = g_ngw; i-- > 0 && g_gw[i].fence > done;) {
+            const gpuw_t *w = &g_gw[i];
+            if (w->fence <= g_fence) mtl_wait(w->fence, UINT64_MAX);
+            else { mtl_wait(mtl_sub_commit(), UINT64_MAX); vk_sub_resume(); }
+            return;
+        }
+        return;
+    }
     // Appends and compaction preserve fence order. Only the live suffix matters;
     // waiting for its newest uncovered overlap also completes every older one.
     for (size_t i = g_ngw; i-- > 0 && g_gw[i].fence > done;) {
@@ -1658,16 +1743,17 @@ void vk_cpu_ready(uint64_t a, uint64_t n) {
         if (w->lo >= a + n || a >= w->hi) continue;
         uint64_t at = a > w->lo ? a : w->lo;
         uint64_t end = a + n < w->hi ? a + n : w->hi;
-        while (at < end) {
-            uint64_t covered = at;
+        uint64_t guest_at = guest_a + (at - a), guest_end = guest_at + (end - at);
+        while (guest_at < guest_end) {
+            uint64_t covered = guest_at;
             for (int j = 0; j < g_nubd; j++) {
                 const ubd_t *k = &g_ubd[j];
-                if (at >= k->lo && at < k->hi && k->hi > covered) covered = k->hi;
+                if (guest_at >= k->lo && guest_at < k->hi && k->hi > covered) covered = k->hi;
             }
-            if (covered == at) break;
-            at = covered < end ? covered : end;
+            if (covered == guest_at) break;
+            guest_at = covered < guest_end ? covered : guest_end;
         }
-        if (at == end) continue;   // deferred bytes cover prior and open producers alike
+        if (guest_at == guest_end) continue;   // deferred bytes cover prior and open producers alike
         if (w->fence <= g_fence) mtl_wait(w->fence, UINT64_MAX);
         else { mtl_wait(mtl_sub_commit(), UINT64_MAX); vk_sub_resume(); }
         return;
@@ -1677,7 +1763,8 @@ void vk_cpu_ready(uint64_t a, uint64_t n) {
 void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
     if (vk_gpu_pending(a, n)) { static int k; g_ubd_racy++; if (k < 20) { k++; int cov = 0; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo <= a && a + n <= g_ubd[i].hi) cov = 1;
         VKLOG("[RED] a CPU read of %#llx +%llu (%s) overlaps a GPU write not known to be complete", (unsigned long long)a, (unsigned long long)n, cov ? "covered by a deferred update" : "partly from memory"); } }
-    memcpy(dst, (const void *)(uintptr_t)a, n);
+    if (nvn_sparse_address_pool(a, n)) nvn_sparse_address_copy(a, dst, n);
+    else memcpy(dst, (const void *)(uintptr_t)a, n);
     if (g_ninfl) { uint64_t done = vk_fence_done();
         for (int i = 0; i < g_ninfl; i++) { if (g_infl[i].fence <= done) continue; uint64_t lo = g_infl[i].lo > a ? g_infl[i].lo : a, hi = g_infl[i].hi < a + n ? g_infl[i].hi : a + n;
             if (lo < hi) memcpy(dst + (lo - a), g_infl[i].data + (lo - g_infl[i].lo), hi - lo); } }
@@ -1747,12 +1834,25 @@ static void *completion_main(void *a) {
         }
         uint64_t now = gpu_ticks(), tend = 0;
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) tend = t[1]; }
+        // Counter timestamps: one affine map of the GPU clock onto the guest's unit, anchored at the submission's end and at its completion.
+        // The guest clock freezes while the game is held (pause menu, background, the system keyboard: guest_clock_freeze_for) and the GPU
+        // counter keeps running, so the map is re-anchored when its end leads now. Now leading the map's end by 100 ms also catches a counter
+        // wrap (a driver with fewer valid timestamp bits) and slow drift; a report then never lands past the guest clock.
+        static uint64_t g_ts_o; static int g_ts_set; uint64_t ts_end = now;
+        if (tend) {
+            uint64_t qe = (uint64_t)((double)tend * V.props.limits.timestampPeriod * 12 / 625);   // GPU ticks → NVN ticks, the guest's 625/12 ns unit
+            if (!g_ts_set || g_ts_o + qe > now || now - (g_ts_o + qe) > 1920000ull) { g_ts_o = now - qe; g_ts_set = 1; }   // 100 ms in NVN ticks
+            ts_end = g_ts_o + qe;
+        }
         for (int i = 0; i < c->n; i++) {
             post_op *o = &c->ops[i];
             if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; continue; }
-            uint64_t ts = now, tq;
-            if (o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq <= tend) {
-                uint64_t back = (uint64_t)((double)(tend - tq) * V.props.limits.timestampPeriod * 12 / 625); if (back < now) ts = now - back; }
+            // The guest measures frame time as the difference of two reports; back-dating each to its own submission's completion compressed
+            // that difference (the completion thread drains several submissions in one burst), so Unreal's automatic resolution read 17 ms of a
+            // frame that took 33 ms and raised the resolution. A report without a usable query takes the submission's end on the same map.
+            uint64_t ts = ts_end, tq = 0;
+            if (o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq && tq <= tend)
+                ts = g_ts_o + (uint64_t)((double)tq * V.props.limits.timestampPeriod * 12 / 625);
             // render_cond: a timestamp report's counter field is 0, as on the GPU (gfx_vk_exec.c render_cond evaluates conditions on it)
             uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? (DM_GAME_RENDER_COND ? 0 : ts) : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (1u << 20) : 0, ts}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
         }

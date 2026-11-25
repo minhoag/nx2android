@@ -72,6 +72,16 @@ class AndroidProfiles(unittest.TestCase):
         for v in ('10', '85', '42'):
             with self.assertRaises(android_profile.ProfileError, msg=v): android_profile.load(profile_dir([('status', 'boots'), ('setting', f'opacity={v}')]).name)
 
+    def test_sharpness_setting(self):   # super resolution's Sharpness slider, 0..100 by 25 (front_android.c settings_load sharpness=)
+        d = profile_dir([('status', 'boots'), ('setting', 'sharpness=75')])
+        self.assertEqual(android_profile.load(d.name).settings, {'sharpness': '75'})
+        with self.assertRaises(android_profile.ProfileError): android_profile.load(profile_dir([('status', 'boots'), ('setting', 'sharpness=60')]).name)
+
+    def test_sr_setting(self):   # super resolution, off or on (the pause menu's row, front_android.c settings_load sr=)
+        d = profile_dir([('status', 'boots'), ('setting', 'sr=1')])
+        self.assertEqual(android_profile.load(d.name).settings, {'sr': '1'})
+        with self.assertRaises(android_profile.ProfileError): android_profile.load(profile_dir([('status', 'boots'), ('setting', 'sr=2')]).name)
+
     def test_default_package(self):
         d = profile_dir([('status', 'boots')])
         self.assertEqual(android_profile.load(d.name).package, 'org.nx2a.t0100000000aaa000')
@@ -442,6 +452,20 @@ class Misc(unittest.TestCase):
             with self.assertRaises(pipeline.BuildError): pipeline.Port.check_space(p)
             work.mkdir(); (work / 'x').write_bytes(b'\0' * 2**20); pipeline.Port.check_space(p)   # a build folder already there counts
         finally: shutil.disk_usage = real
+
+    def test_disk_space_counts_only_the_selected_dump(self):   # one dump picked out of a folder of games: the others are not being ported (SMBW asked for 4,000 GB)
+        from types import SimpleNamespace as NS
+        d = Path(tempfile.mkdtemp(prefix='nx2a_test_game_')); g = d / 'g.nsp'; g.write_bytes(b'\0' * 2**20)
+        other = d / 'other.nsp'
+        with open(other, 'wb') as f: f.truncate(4 * 2**30)   # a sparse 4 GB: big for the estimator, nothing on the disk
+        p = NS(o=NS(folder=d, dump=g), work=d / 'build'); real = shutil.disk_usage
+        try:
+            shutil.disk_usage = lambda _: NS(free=2**30 + 2**22)   # enough for the selected dump alone (about 1 GB + 2 MB), not for the folder (about 9 GB)
+            pipeline.Port.check_space(p)
+            p.o = NS(folder=d, dump=None)
+            with self.assertRaises(pipeline.BuildError): pipeline.Port.check_space(p)
+        finally:
+            shutil.disk_usage = real; other.unlink()
 
 
 def _hfs0(files):   # an HFS0 of (name, data): the XCI's partitions (hash fields left zero: nothing here reads them)

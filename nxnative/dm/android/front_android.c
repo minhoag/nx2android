@@ -9,6 +9,7 @@
 #include "dm.h"
 #include "front.h"
 #include "dm_input.h"
+#include "locale_android.h"
 #include "pad_slots.h"
 #include "overlay_layout.h"
 #include "stick_axis.h"
@@ -39,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 void front_run(void (*guest)(void)) { guest(); }
@@ -50,8 +52,7 @@ void front_screen_match(int fps) { (void)fps; }
 // ---------------- the app ----------------
 static ANativeActivity *g_act;
 static jmethodID g_audio_menu_method;
-static jmethodID g_mod_menu_method;
-static jmethodID g_mod_manage_method;
+static jmethodID g_mod_menu_method, g_mod_manage_method, g_mod_start;
 int dm_menu_audio_available(void) { return g_audio_menu_method != NULL; }
 int dm_menu_mod_available(void) { return g_mod_menu_method != NULL; }
 int dm_menu_mod_manage_available(void) { return g_mod_manage_method != NULL; }
@@ -89,6 +90,8 @@ static jclass g_runtime_class;
 static jmethodID g_runtime_prepare, g_runtime_check_data;
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
+static _Atomic int g_set_sr;   // Super resolution: the game's picture upscaled into a larger window by the present pass (gfx_vk_present.c sr_ready)
+static _Atomic int g_set_sharp;   // its Sharpness, percent by 25 (the menu's slider, settings.txt sharpness=)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 // the menu button in play (issue #397): env.txt's DM_MENU_BUTTON=0 (porter port --no-menu-button) leaves it out, as a control the player hid (dm_overlay_hidden):
 // not drawn and not touchable, on the gamepad and over the pause menu, so its corner of the screen is the game's. Back (the system's back gesture or key) and a
@@ -129,11 +132,12 @@ static int fps_opt_press(int item) {   // a menu item of the Counter or Style ta
 // FPS_OPTS_END
 int dm_fps_opts(void) { return atomic_load(&g_fps_opts); }   // gfx_vk_present.c: the counter's options, packed (fpso_*)
 static void settings_load(void) {
-    char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
-    if (!f) return;
-    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
+    char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128]; int seen_overlay = 0;
+    while (f && fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) { atomic_store(&g_set_overlay, v != 0); seen_overlay = 1; } else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (fps_opt_parse(line)) {}
+        else if (sscanf(line, "sr=%d", &v) == 1) atomic_store(&g_set_sr, v != 0);
+        else if (sscanf(line, "sharpness=%d", &v) == 1) atomic_store(&g_set_sharp, v < 0 ? 0 : v > 100 ? 100 : v / 25 * 25);
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
@@ -149,13 +153,16 @@ static void settings_load(void) {
         } else if (sscanf(line, "menu_x=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][0], v + 1); }   // before
         else if (sscanf(line, "menu_y=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][1], v + 1); }   // the editor
     }
-    fclose(f);
+    if (f) fclose(f);
+    // A touch-only game's profile (DM_TOUCH): until the player sets Show gamepad themselves, the game starts with the gamepad hidden, so with dm_overlay_visible() == 2
+    // every touch goes to the game's touch screen and only the menu button answers. The player's own switch is saved and wins on the next start.
+    if (!seen_overlay) { const char *e = getenv("DM_TOUCH"); if (e && atoi(e)) atomic_store(&g_set_overlay, 0); }
 }
 static void settings_save(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
-    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
-            atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
+    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nsr=%d\nsharpness=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0,
+            atomic_load(&g_set_fps), atomic_load(&g_set_sr), atomic_load(&g_set_sharp), atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
     fps_opt_write(f);
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
@@ -418,9 +425,9 @@ static int64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC
 // A system input device can report itself as an active controller (issues #22, #210). The saved choice must still work, and the menu must stay reachable.
 int dm_overlay_visible(void) { return atomic_load(&g_set_overlay) && atomic_load(&g_overlay) ? 1 : 2; }
 int dm_overlay_layout(void) {   // the phone's layout in a window at least OV_PHONE_ASPECT wide for its height (overlay_layout.h)
-    static int last_w = -1, last_h = -1, phone;
-    ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, wh = w ? ANativeWindow_getHeight(w) : 0;
-    if (ww != last_w || wh != last_h) { last_w = ww; last_h = wh; phone = ov_layout_for_size(ww, wh);
+    static int last_w = -1, last_h = -1, last_x = -1, phone;
+    ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, wh = w ? ANativeWindow_getHeight(w) : 0, ext = dm_external_active();
+    if (ww != last_w || wh != last_h || ext != last_x) { last_w = ww; last_h = wh; last_x = ext; phone = ov_layout_for_size(ww, wh);   // (an external display takes the band away: ov_band)
         if (wh > 0) LOG("[overlay] window %dx%d: the %s layout", ww, wh, phone ? "phone" : "tablet"); }
     return phone;
 }
@@ -447,10 +454,12 @@ int64_t dm_overlay_pressed(int ctl, uint64_t bit) {
     return bit && bit < 1u << 16 ? atomic_load(&g_press_t[__builtin_ctzll(bit)]) : 0;
 }
 static int g_dpi;   // the display's density (AConfiguration), 0 = unknown
+int dm_overlay_dpi(void) { return g_dpi; }
 float dm_overlay_scale(void) {
-    static int last_w = -1, last_h = -1; static float s = 1;
-    ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, h = w ? ANativeWindow_getHeight(w) : 0;
-    if (h != last_h || ww != last_w) { last_w = ww; last_h = h; s = 1;   // (the width picks the layout, whose buttons are sized for its form factor)
+    static int last_w = -1, last_h = -1, last_x = -1; static float s = 1;
+    ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, h = w ? ANativeWindow_getHeight(w) : 0, ext = dm_external_active();
+    if (h != last_h || ww != last_w || ext != last_x) { last_w = ww; last_h = h; last_x = ext; s = 1;   // (the width picks the layout, whose buttons are sized for its form factor)
+        { float y0, bh; if (ov_band((float)ww, (float)h, &y0, &bh)) h = (int)bh; }   // (the band under the picture is the gamepad's window: overlay_layout.h ov_band)
         float face = 0.1f; const ov_ctl *L = OV_CTLS; for (int i = 0; i < OV_N; i++) if (L[i].kind == OV_BUTTON && L[i].btn == DM_BTN_A) face = L[i].w;   // A's width, in window heights
         if (h > 0 && g_dpi > 0 && g_dpi < 0xfffe) { float mm = face * (float)h / (float)g_dpi * 25.4f; s = OV_MIN_MM / mm; if (s < 1) s = 1; if (s > 1.45f) s = 1.45f; s = ov_fit_scale(OV_CTLS, (float)ww, (float)h, s); }   // (no further than the controls fit the window)
         LOG("[overlay] window %dx%d, density %d dpi: face buttons %.1f mm, controls x%.2f", ww, h, g_dpi, h > 0 && g_dpi > 0 && g_dpi < 0xfffe ? face * h / g_dpi * 25.4f : 0, s); }
@@ -462,7 +471,7 @@ JNIEXPORT jfloatArray JNICALL Java_org_nx2a_ExternalActivity_externalOverlay(JNI
     (void)cls;
     if (width <= 0 || height <= 0) return NULL;
     int layout = ov_layout_for_size(width, height);
-    jfloat values[5 + OV_N * 9];
+    jfloat values[6 + OV_N * 9];
     int state = dm_menu_state();
     values[0] = layout; values[1] = dm_overlay_scale(); values[2] = dm_overlay_opacity(); values[3] = state < 0 ? -1 : state & 0xffffff;
     for (int i = 0; i < OV_N; i++) {
@@ -477,8 +486,9 @@ JNIEXPORT jfloatArray JNICALL Java_org_nx2a_ExternalActivity_externalOverlay(JNI
         v[0] = ov_off(c) && c->kind != OV_MENU ? -1 : c->kind; v[1] = b[0]; v[2] = b[1]; v[3] = b[2]; v[4] = b[3]; v[5] = (jfloat)held; v[6] = kx; v[7] = ky; v[8] = ov_cscale(c);
     }
     values[4 + OV_N * 9] = dm_overlay_visible();
-    jfloatArray out = (*env)->NewFloatArray(env, (jsize)(5 + OV_N * 9));
-    if (out) (*env)->SetFloatArrayRegion(env, out, 0, (jsize)(5 + OV_N * 9), values);
+    values[5 + OV_N * 9] = OVM_ROWS;   // the menu's rows (ExternalActivity's drawMenu and drawEditor: the panel's height and fit)
+    jfloatArray out = (*env)->NewFloatArray(env, (jsize)(6 + OV_N * 9));
+    if (out) (*env)->SetFloatArrayRegion(env, out, 0, (jsize)(6 + OV_N * 9), values);
     return out;
 }
 static int g_ptr_ctl[32];   // pointer id → control index + 1 (0 = the touch screen)
@@ -509,8 +519,8 @@ static void menu_drag(const ov_ctl *m, float x, float y, float W, float H) {   /
     if (!g_drag.moved && hypotf(x - g_drag.x0, y - g_drag.y0) < OV_DRAG_SLOP * H) return;
     g_drag.moved = 1;
     float b[4]; ov_box(m, W, H, b);
-    float px = ov_drag_pos(x + g_drag.gx, b[2], W, 0), py = ov_drag_pos(y + g_drag.gy, b[3], H, 0); int l, i = ov_index(m, &l);
-    cust_place(0, l, i, px / W, py / H); atomic_fetch_add(&g_cust_ver, 1);
+    float fx, fy; ov_drag_place(x + g_drag.gx, y + g_drag.gy, b[2], b[3], W, H, 0, &fx, &fy); int l, i = ov_index(m, &l);   // (against the band under the picture, if any)
+    cust_place(0, l, i, fx, fy); atomic_fetch_add(&g_cust_ver, 1);
 }
 
 // ---- controllers attached: InputDevice's list, read once a second through JNI (a code-less NativeActivity has no InputManager listener). A device counts
@@ -630,11 +640,30 @@ int dm_menu_state(void) {
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
+    int tab = atomic_load(&g_menu_tab);
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 19 | (atomic_load(&g_fps_ver) & 3) << 29 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28;
+           (tab & 1) << 8 | (tab >> 1 & 1) << 19 | (tab >> 2 & 1) << 27 | (atomic_load(&g_fps_ver) & 3) << 29 |
+           (atomic_load(&g_set_opacity) - OV_OPACITY_MIN) / 5 << 9 | (atomic_load(&g_set_sharp) / 25) << 13 |
+           (atomic_load(&g_sv_st) & 7) << 20 | (atomic_load(&g_sv_n) & 7) << 24 | pad_labels() << 28 | atomic_load(&g_set_sr) << 23;
+}
+int dm_ui_zh(void) {
+    const char *e = getenv("DM_UI_LANG");
+    if (e && *e) return e[0] == 'z' || e[0] == 'Z';
+    static _Atomic int sys = -1;
+    int cur = atomic_load(&sys);
+    if (cur >= 0) return cur;
+    char loc[PROP_VALUE_MAX] = "";
+    if (!__system_property_get("persist.sys.locale", loc) || !loc[0])
+        if (!__system_property_get("ro.product.locale", loc) || !loc[0])
+            __system_property_get("persist.sys.language", loc);
+    cur = (loc[0] == 'z' || loc[0] == 'Z') && (loc[1] == 'h' || loc[1] == 'H');
+    atomic_store(&sys, cur);
+    return cur;
 }
 // gfx_vk_present.c draws the counter: not while the menu holds the game, except under the pause menu's Counter and Style tabs, where it shows what they change
-int dm_overlay_fps(void) { return atomic_load(&g_menu) ? atomic_load(&g_menu_tab) >= 2 && !atomic_load(&g_edit) && !atomic_load(&g_sp_on) && !atomic_load(&g_tx_on) : atomic_load(&g_set_fps); }
+int dm_overlay_fps(void) { return atomic_load(&g_menu) ? (atomic_load(&g_menu_tab) == 2 || atomic_load(&g_menu_tab) == 3) && !atomic_load(&g_edit) && !atomic_load(&g_sp_on) && !atomic_load(&g_tx_on) : atomic_load(&g_set_fps); }
+int dm_overlay_sr(void) { return atomic_load(&g_set_sr); }   // gfx_vk_present.c: the present pass upscales with SGSR 1.0 when the picture grows
+int dm_overlay_sharp(void) { return atomic_load(&g_set_sharp); }   // its Sharpness, percent
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
     atomic_store(&g_menu_hi, hi); g_menu_ptr = -1;
@@ -655,47 +684,38 @@ static void menu_close(void) {
     if (!atomic_exchange(&g_menu, 0)) return;
     g_menu_ptr = -1; atomic_store(&g_menu_t, 0);
     hold_sync(); dm_haptics_suspend(4, 0); dm_overlay_redraw();
-    LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, face buttons by %s, frame rate %s %#x, %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
-        atomic_load(&g_set_rumble) ? "on" : "off", pad_labels() ? "label" : "position", atomic_load(&g_set_fps) ? "shown" : "hidden", atomic_load(&g_fps_opts), dm_opmode() ? "docked" : "handheld");
+    LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, face buttons by %s, frame rate %s %#x, super resolution %s (%d%% sharp), %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
+        atomic_load(&g_set_rumble) ? "on" : "off", pad_labels() ? "label" : "position", atomic_load(&g_set_fps) ? "shown" : "hidden", atomic_load(&g_fps_opts), atomic_load(&g_set_sr) ? "on" : "off",
+        atomic_load(&g_set_sharp), dm_opmode() ? "docked" : "handheld");
+}
+static void menu_sharp(int v) {   // the Sharpness slider: whole 25 percent steps, drawn at once and saved when the finger lifts or with each controller step
+    v = v < 0 ? 0 : v > 100 ? 100 : (v + 12) / 25 * 25;
+    if (atomic_exchange(&g_set_sharp, v) != v) { dm_haptics_android_tap(); dm_overlay_redraw(); }
 }
 static void menu_opacity(int v) {   // the slider: a new value is drawn at once and saved when the finger lifts (menu_touch) or with each controller step
     v = v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v;
     if (atomic_exchange(&g_set_opacity, v) != v) { dm_haptics_android_tap(); dm_overlay_redraw(); }
 }
-static void menu_tab(int t) { t = (t % OVM_TABS + OVM_TABS) % OVM_TABS; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
+static void menu_tab(int t) { int n = ov_menu_tabs(); t = (t % n + n) % n; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
 static void ed_open(void); static void sp_open(void); static void save_export(void);
-static void menu_audio(void) {
-    if (!g_act || !g_act->vm || !g_act->clazz || !g_audio_menu_method) return;
+static void menu_java(jmethodID method, const char *action) {
+    if (!g_act || !g_act->vm || !g_act->clazz || !method) return;
     JNIEnv *e = NULL; int attached = 0;
     if ((*g_act->vm)->GetEnv(g_act->vm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
         if ((*g_act->vm)->AttachCurrentThread(g_act->vm, &e, NULL) != JNI_OK) return;
         attached = 1;
     }
-    (*e)->CallVoidMethod(e, g_act->clazz, g_audio_menu_method);
-    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); LOG("[menu] audio selection is unavailable"); }
+    (*e)->CallVoidMethod(e, g_act->clazz, method);
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); LOG("[RED] [menu] %s is unavailable", action); }
     if (attached) (*g_act->vm)->DetachCurrentThread(g_act->vm);
-}
-static void *menu_mod_worker(void *arg) {
-    pthread_mutex_lock(&g_win_mu);
-    ANativeActivity *act = g_act;
-    JavaVM *vm = act->vm;
-    JNIEnv *env = NULL;
-    if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) { pthread_mutex_unlock(&g_win_mu); return NULL; }
-    jobject activity = (*env)->NewLocalRef(env, act->clazz);
-    pthread_mutex_unlock(&g_win_mu);
-    if (activity) {
-        (*env)->CallVoidMethod(env, activity, arg ? g_mod_manage_method : g_mod_menu_method);
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-        (*env)->DeleteLocalRef(env, activity);
-    }
-    (*vm)->DetachCurrentThread(vm);
-    return NULL;
 }
 static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
     else if (fps_opt_press(item)) settings_save();   // the counter's rows, corner, colour, outline and size
+    else if (item == OVM_SR) { atomic_store(&g_set_sr, !atomic_load(&g_set_sr)); settings_save(); }   // the next present draws the frame again through it
+    else if (item == OVM_SHARP) return;   // (the slider is dragged, or stepped with left and right, as the opacity's)
     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
     else if (item == OVM_PAD) { atomic_store(&g_set_labels, !pad_labels()); settings_save(); }   // at once (pad_labels)
     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
@@ -703,9 +723,9 @@ static void menu_do(int item) {
     else if (item == OVM_OPACITY) return;   // (the slider is dragged, or stepped with left and right)
     else if (item == OVM_EXPORT) { if (atomic_load(&g_sv_st) == OVX_BUSY) return; save_export(); }
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
-    else if (item == OVM_AUDIO) { menu_audio(); }
-    else if (item == OVM_MOD_IMPORT) { pthread_t t; if (!pthread_create(&t, NULL, menu_mod_worker, NULL)) pthread_detach(t); }
-    else if (item == OVM_MOD_MANAGE) { pthread_t t; if (!pthread_create(&t, NULL, menu_mod_worker, (void *)1)) pthread_detach(t); }
+    else if (item == OVM_AUDIO) { menu_java(g_audio_menu_method, "audio selection"); }
+    else if (item == OVM_MOD_IMPORT) { menu_java(g_mod_menu_method, "mod import"); }
+    else if (item == OVM_MOD_MANAGE) { menu_java(g_mod_manage_method, "mod manager"); }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
 }
@@ -720,17 +740,19 @@ static void menu_touch(AInputEvent *e, float W, float H) {   // a press on a row
         g_menu_ptr = id; g_menu_row = row;
         if (item == OVM_TAB) menu_tab(ov_menu_tab_at(x, p));   // a tab opens as the finger touches it
         else if (item == OVM_OPACITY) menu_opacity(ov_menu_track_value(x, p, row));
+        else if (item == OVM_SHARP) menu_sharp(ov_menu_track_pct(x, p, row));
         if (row >= 0) { atomic_store(&g_menu_hi, item >= 0 ? row : -1); dm_overlay_redraw(); }
     } else if (act == AMOTION_EVENT_ACTION_MOVE && g_menu_ptr >= 0 && g_menu_row >= 0) {   // the slider follows the finger; another row's highlight follows it off the row and back
         for (size_t k = 0; k < AMotionEvent_getPointerCount(e); k++) if ((AMotionEvent_getPointerId(e, k) & 31) == g_menu_ptr) {
             float kx = AMotionEvent_getX(e, k), ky = AMotionEvent_getY(e, k);
             if (ov_menu_item(tab, g_menu_row) == OVM_OPACITY) { menu_opacity(ov_menu_track_value(kx, p, g_menu_row)); continue; }
+            if (ov_menu_item(tab, g_menu_row) == OVM_SHARP) { menu_sharp(ov_menu_track_pct(kx, p, g_menu_row)); continue; }
             int r = ov_menu_row_at(kx, ky, W, H), hi = r == g_menu_row && ov_menu_item(tab, r) >= 0 ? r : -1;
             if (atomic_exchange(&g_menu_hi, hi) != hi) dm_overlay_redraw();
         }
     } else if ((act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_POINTER_UP) && id == g_menu_ptr) {
         int down = g_menu_row; g_menu_ptr = -1; atomic_store(&g_menu_hi, -1);
-        if (down >= 0 && ov_menu_item(tab, down) == OVM_OPACITY) { settings_save(); dm_overlay_redraw(); }
+        if (down >= 0 && (ov_menu_item(tab, down) == OVM_OPACITY || ov_menu_item(tab, down) == OVM_SHARP)) { settings_save(); dm_overlay_redraw(); }
         else if (row == down && item >= 0 && item != OVM_TAB) menu_do(item);
         else if (row == down && (row == -2 || row == -3)) { dm_haptics_android_tap(); menu_close(); }
         else dm_overlay_redraw();
@@ -745,6 +767,7 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
         for (int k = 0; k < OVM_ROWS; k++) { hi = hi < 0 ? (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1) : (hi + (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1)) % OVM_ROWS; if (ov_menu_item(tab, hi) >= 0) break; }
         atomic_store(&g_menu_hi, hi); dm_overlay_redraw();
     } else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_OPACITY) { menu_opacity(atomic_load(&g_set_opacity) + (bit == DM_BTN_LEFT ? -5 : 5)); settings_save(); }
+    else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_SHARP) { menu_sharp(atomic_load(&g_set_sharp) + (bit == DM_BTN_LEFT ? -25 : 25)); settings_save(); }
     else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_TAB) menu_tab(tab + (bit == DM_BTN_LEFT ? -1 : 1));
     else if (bit == DM_BTN_L || bit == DM_BTN_ZL || bit == DM_BTN_R || bit == DM_BTN_ZR) {
         menu_tab(tab + (bit == DM_BTN_L || bit == DM_BTN_ZL ? -1 : 1));
@@ -843,8 +866,13 @@ static void sp_touch(AInputEvent *e, float W, float H) {   // a row is done when
     } else if (act == AMOTION_EVENT_ACTION_CANCEL) g_sp.ptr = -1;
 }
 static void sp_size(char *out, int cap, const dm_save_entry *s) {
-    if (s->bytes >= 1 << 20) snprintf(out, (size_t)cap, "%ld file%s, %.1f MB", s->files, s->files == 1 ? "" : "s", s->bytes / 1048576.0);
-    else snprintf(out, (size_t)cap, "%ld file%s, %lld KB", s->files, s->files == 1 ? "" : "s", (s->bytes + 1023) / 1024);
+    if (dm_ui_zh()) {
+        if (s->bytes >= 1 << 20) snprintf(out, (size_t)cap, "%ld 个文件，%.1f MB", s->files, s->bytes / 1048576.0);
+        else snprintf(out, (size_t)cap, "%ld 个文件，%lld KB", s->files, (s->bytes + 1023) / 1024);
+    } else {
+        if (s->bytes >= 1 << 20) snprintf(out, (size_t)cap, "%ld file%s, %.1f MB", s->files, s->files == 1 ? "" : "s", s->bytes / 1048576.0);
+        else snprintf(out, (size_t)cap, "%ld file%s, %lld KB", s->files, s->files == 1 ? "" : "s", (s->bytes + 1023) / 1024);
+    }
 }
 #define SP_ROW(i, st, ...) do { rows[i].style = st; snprintf(rows[i].left, sizeof rows[i].left, __VA_ARGS__); } while (0)
 int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
@@ -852,22 +880,26 @@ int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
     memset(rows, 0, sizeof(ov_srow) * OVM_ROWS);
     pthread_mutex_lock(&g_sp_mu);
     if (g_sp.closing) {
-        SP_ROW(0, OVS_TITLE, "Importing the save"); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
-        SP_ROW(2, OVS_NOTE, "The game closes now. Open it again:"); SP_ROW(3, OVS_NOTE, "the save is imported as it starts.");
+        SP_ROW(0, OVS_TITLE, "%s", TR("Importing the save", "正在导入存档")); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
+        SP_ROW(2, OVS_NOTE, "%s", TR("The game closes now. Open it again:", "游戏即将关闭，请重新打开："));
+        SP_ROW(3, OVS_NOTE, "%s", TR("the save is imported as it starts.", "启动时将自动导入该存档。"));
     } else if (g_sp.confirm) {
-        SP_ROW(0, OVS_TITLE, "Import this save?"); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
-        SP_ROW(2, OVS_NOTE, "Your current save is exported first,"); SP_ROW(3, OVS_NOTE, "then the game closes: open it again.");
-        SP_ROW(OVM_ROWS - 2, OVS_BUTTON, "Import and close"); SP_ROW(OVM_ROWS - 1, OVS_BACK, "Cancel");
+        SP_ROW(0, OVS_TITLE, "%s", TR("Import this save?", "确定导入此存档？")); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
+        SP_ROW(2, OVS_NOTE, "%s", TR("Your current save is exported first,", "会先导出当前存档，"));
+        SP_ROW(3, OVS_NOTE, "%s", TR("then the game closes: open it again.", "随后关闭游戏，请重新打开。"));
+        SP_ROW(OVM_ROWS - 2, OVS_BUTTON, "%s", TR("Import and close", "导入并关闭")); SP_ROW(OVM_ROWS - 1, OVS_BACK, "%s", TR("Cancel", "取消"));
     } else {
         int pages = (g_sp.n + SP_PER - 1) / SP_PER, k = sp_on_page();
-        SP_ROW(0, OVS_TITLE, "Import a save"); if (pages > 1) snprintf(rows[0].right, sizeof rows[0].right, "page %d of %d", g_sp.page + 1, pages);
+        SP_ROW(0, OVS_TITLE, "%s", TR("Import a save", "导入存档"));
+        if (pages > 1) { if (dm_ui_zh()) snprintf(rows[0].right, sizeof rows[0].right, "第 %d / %d 页", g_sp.page + 1, pages); else snprintf(rows[0].right, sizeof rows[0].right, "page %d of %d", g_sp.page + 1, pages); }
         for (int j = 0; j < k; j++) { const dm_save_entry *s = &g_sp.e[g_sp.page * SP_PER + j]; SP_ROW(1 + j, OVS_ITEM, "%s", s->name); sp_size(rows[1 + j].right, sizeof rows[1 + j].right, s); }
         if (!g_sp.n) {
             const char *d = strstr(dm_saves_dir(), "Android/data/");
-            SP_ROW(1, OVS_NOTE, "No saves yet. Export one, or put a save folder"); SP_ROW(2, OVS_NOTE, "(a console's, as its save tools copy it) in");
+            SP_ROW(1, OVS_NOTE, "%s", TR("No saves yet. Export one, or put a save folder", "暂无存档。请先导出，或将存档文件夹"));
+            SP_ROW(2, OVS_NOTE, "%s", TR("(a console's, as its save tools copy it) in", "放入以下目录："));
             SP_ROW(3, OVS_NOTE, "%s", d ? d : dm_saves_dir());
         }
-        SP_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
+        SP_ROW(OVM_ROWS - 1, OVS_BACK, "%s", TR("Back", "返回"));
     }
     pthread_mutex_unlock(&g_sp_mu);
     return 1;
@@ -919,9 +951,8 @@ static void ed_key(uint64_t bit) {
 }
 static void ed_drag(float x, float y, float W, float H) {   // the chosen control's centre follows the finger, kept on the screen
     int l = dm_overlay_layout(); float b[4]; ov_box(&OV_LAYOUTS[l][g_ed.sel], W, H, b);
-    float step = atomic_load(&g_set_grid) ? H / OVE_GRID_ROWS : 0;
-    float px = ov_drag_pos(x + g_ed.gx, b[2], W, step), py = ov_drag_pos(y + g_ed.gy, b[3], H, step);
-    cust_place(1, l, g_ed.sel, px / W, py / H); g_ed.dirty = 1;
+    float fx, fy; ov_drag_place(x + g_ed.gx, y + g_ed.gy, b[2], b[3], W, H, atomic_load(&g_set_grid) ? OVE_GRID_ROWS : 0, &fx, &fy);   // (against the band, if any)
+    cust_place(1, l, g_ed.sel, fx, fy); g_ed.dirty = 1;
 }
 static void ed_touch(AInputEvent *e, float W, float H) {   // the prompt's buttons, else the toolbar's, else the controls
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
@@ -1052,7 +1083,7 @@ static int overlay_text_input(const char *title, const char *sub, const char *gu
     if (!out || out_cap <= 0) return -1;
     if (!g_act || !dm_front_window()) return -1;   // the adb shell executable, or no window yet: nothing is shown
     pthread_mutex_lock(&g_tx_mu);
-    const char *t = title && *title ? title : guide && *guide ? guide : sub && *sub ? sub : "Enter text";
+    const char *t = title && *title ? title : guide && *guide ? guide : sub && *sub ? sub : TR("Enter text", "输入文本");
     snprintf(g_tx.title, sizeof g_tx.title, "%s", t); pf_trim(g_tx.title);
     g_tx.cap = out_cap - 1 < (int)sizeof g_tx.text - 1 ? out_cap - 1 : (int)sizeof g_tx.text - 1;
     g_tx.n = 0; g_tx.text[0] = 0;
@@ -1441,6 +1472,19 @@ static void *host_thread(void *a) {
         runtime_default("DM_FPS_LOCKS", "fpslock.tsv");
         LOG("[runtime] bundled runtime ready: %s", g_runtime);
     }
+    if (g_mod_start) {
+        JavaVM *vm = g_act->vm; JNIEnv *env;
+        if ((*vm)->AttachCurrentThread(vm, &env, NULL) == JNI_OK) {
+            jstring path = (*env)->CallObjectMethod(env, g_act->clazz, g_mod_start, getenv("DM_ROMFS_OVERLAY") != NULL);
+            if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); LOG("[RED] [mod] selection unavailable; using original RomFS"); g_mod_menu_method = g_mod_manage_method = NULL; }
+            else if (path) {
+                const char *value = (*env)->GetStringUTFChars(env, path, NULL);
+                setenv("DM_ROMFS_OVERLAY", value, 1); LOG("[mod] experimental overlay %s", value);
+                (*env)->ReleaseStringUTFChars(env, path, value); (*env)->DeleteLocalRef(env, path);
+            }
+            (*vm)->DetachCurrentThread(vm);
+        } else g_mod_menu_method = g_mod_manage_method = NULL;
+    } else g_mod_menu_method = g_mod_manage_method = NULL;
     char mods[1100]; snprintf(mods, sizeof mods, "%s/mods", g_runtime[0] ? g_runtime : g_root);
     char *argv[] = {"dmhost", mods, NULL};
     atomic_store(&g_running, 1);
@@ -1460,6 +1504,35 @@ static void env_file(const char *path) {   // KEY=VALUE per line (# comments): s
     }
     fclose(f);
 }
+
+static void select_game_language(JNIEnv *env) {
+    const char *setting = getenv("DM_LANG");
+    if (!setting || strcmp(setting, "system")) return;
+    const char *supported = getenv("DM_LANG_SUPPORTED");
+    const char *code = android_game_language("", supported);
+    if ((*env)->PushLocalFrame(env, 4) == JNI_OK) {
+        do {
+            jclass locale = (*env)->FindClass(env, "java/util/Locale");
+            if (jx(env) || !locale) break;
+            jmethodID get = (*env)->GetStaticMethodID(env, locale, "getDefault", "()Ljava/util/Locale;");
+            if (jx(env) || !get) break;
+            jmethodID tag = (*env)->GetMethodID(env, locale, "toLanguageTag", "()Ljava/lang/String;");
+            if (jx(env) || !tag) break;
+            jobject current = (*env)->CallStaticObjectMethod(env, locale, get);
+            if (jx(env) || !current) break;
+            jstring value = (*env)->CallObjectMethod(env, current, tag);
+            if (jx(env) || !value) break;
+            const char *locale_tag = (*env)->GetStringUTFChars(env, value, NULL);
+            if (jx(env) || !locale_tag) break;
+            code = android_game_language(locale_tag, supported);
+            LOG("[locale] Android %s -> game %s", locale_tag, code);
+            (*env)->ReleaseStringUTFChars(env, value, locale_tag);
+        } while (0);
+        (*env)->PopLocalFrame(env, NULL);
+    } else jx(env);
+    setenv("DM_LANG", code, 1);
+}
+
 // ---- a RomFS outside the app's files folder (env.txt's DM_ROMFS, written by porter install --romfs-at: a game dump another app also reads, a folder on the SD card). The app
 // reads it only with All files access (the appop MANAGE_EXTERNAL_STORAGE, Android 11 on) or, on Android 10, READ_EXTERNAL_STORAGE in the legacy storage view: mkapk.py asks
 // for both and porter grants them over adb. Without it scoped storage gives the app none of the files another app made there, and the game would fail somewhere in its
@@ -1522,7 +1595,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     if (activity_class) g_mod_manage_method = (*env)->GetMethodID(env, activity_class, "manageMods", "()V");
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-    jmethodID mod_start = activity_class ? (*env)->GetMethodID(env, activity_class, "startMods", "(Ljava/lang/String;Z)Ljava/lang/String;") : NULL;
+    g_mod_start = activity_class ? (*env)->GetMethodID(env, activity_class, "startMods", "(Z)Ljava/lang/String;") : NULL;
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     if (activity_class) (*env)->DeleteLocalRef(env, activity_class);
     snprintf(g_root, sizeof g_root, "%s", act->externalDataPath ? act->externalDataPath : act->internalDataPath);
@@ -1540,17 +1613,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     LOG("[runtime] environment DONE");
     LOG("[runtime] env file BEGIN");
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
-    if (mod_start) {
-        jstring title = (*env)->NewStringUTF(env, DM_ANDROID_TITLE_ID);
-        jstring path = (*env)->CallObjectMethod(env, act->clazz, mod_start, title, getenv("DM_ROMFS_OVERLAY") != NULL);
-        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); LOG("[RED] [mod] selection unavailable; using original RomFS"); }
-        else if (path) {
-            const char *value = (*env)->GetStringUTFChars(env, path, NULL);
-            setenv("DM_ROMFS_OVERLAY", value, 1); LOG("[mod] experimental overlay %s", value);
-            (*env)->ReleaseStringUTFChars(env, path, value); (*env)->DeleteLocalRef(env, path);
-        }
-        (*env)->DeleteLocalRef(env, title);
-    }
+    select_game_language(env);
     LOG("[runtime] env file DONE");
     LOG("[runtime] manifest detection BEGIN");
     AAsset *bundle = AAssetManager_open(act->assetManager, "runtime/manifest.json", AASSET_MODE_STREAMING);
