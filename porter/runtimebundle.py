@@ -17,6 +17,10 @@ def build(directory, patched, shaders, font_files, fps_files, package, title_id,
             source = patched / (name + suffix)
             if not source.is_file(): raise BuildError(f'{source}: missing runtime module file')
             sources['mods/' + source.name] = source
+        source = patched / (name + '.compat.tsv')
+        if source.is_file(): sources['mods/' + source.name] = source
+    compat = patched / 'compat.tsv'
+    if compat.is_file(): sources['mods/compat.tsv'] = compat
     nro = patched / 'nro.tsv'
     if nro.is_file():
         sources['mods/nro.tsv'] = nro

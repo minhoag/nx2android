@@ -91,6 +91,8 @@ void *dm_tsd_get(pthread_key_t k);
 
 void load_modules(const char *dir, const char **names, int n);
 void run_module_inits(void);
+void compat_load(const char *dir);   // validated offline hook manifest; absent for ordinary ports
+uint64_t compat_dispatch(int hook, int arg, uint64_t ret, uint64_t orig, uint64_t *regs);
 module_t *nro_find(const uint8_t sha256[32]);   // the mapped NRO with this hash (loader.c)
 int nro_refused(const uint8_t sha256[32]);      // an NRO the pack refused (an online SDK, nro.tsv "refused")
 void nro_load(module_t *m);     // relocate an NRO against the loaded modules and bind the earlier modules' imports it defines (the caller runs its init)

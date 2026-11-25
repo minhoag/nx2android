@@ -37,9 +37,9 @@ public final class RuntimeBundle {
             path = json.getString("path");
             hash = json.getString("sha256");
             size = json.getLong("size");
-            String suffix = cleanup ? "(sites|cuts|obs)\\.tsv" : "(patched\\.bin|fixups\\.tsv|gates\\.tsv)";
+            String suffix = cleanup ? "(sites|cuts|obs)\\.tsv" : "(patched\\.bin|fixups\\.tsv|gates\\.tsv|compat\\.tsv)";
             boolean module = path.matches("mods/[A-Za-z0-9_-]+\\." + suffix);
-            boolean payload = path.equals("mods/nro.tsv") || path.equals("fpslock.tsv")
+            boolean payload = path.equals("mods/nro.tsv") || path.equals("mods/compat.tsv") || path.equals("fpslock.tsv")
                     || path.equals("shaders.dmsv") || path.equals("nintendo_ext.ttf");
             if ((!module && !(cleanup ? path.equals("mods/build_src.sha256") : payload))
                     || size < 0 || !hash.matches("[0-9a-f]{64}"))
