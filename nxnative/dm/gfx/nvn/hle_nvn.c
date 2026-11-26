@@ -1035,12 +1035,42 @@ static const tex_t *tex_snap(void *rec_, size_t off, int k, const NVNtexture *t,
     }
     return s;
 }
+#ifdef DM_DIAGNOSTICS
+// Distinct geometry, not state transitions: repeated boot/frame tuples consume no budget.
+static void geometry_diag(int kind, int index, double x, double y, double w, double h, uint64_t caller) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static struct { int index; double rect[4]; uint64_t caller; } seen[3][256];
+    static unsigned count[3];
+    int saved_errno = errno;
+    pthread_mutex_lock(&mu);
+    unsigned i;
+    for (i = 0; i < count[kind]; i++)
+        if (seen[kind][i].index == index && seen[kind][i].caller == caller &&
+            seen[kind][i].rect[0] == x && seen[kind][i].rect[1] == y && seen[kind][i].rect[2] == w && seen[kind][i].rect[3] == h) break;
+    if (i == count[kind] && i < 256) {
+        seen[kind][i].index = index; seen[kind][i].caller = caller;
+        seen[kind][i].rect[0] = x; seen[kind][i].rect[1] = y; seen[kind][i].rect[2] = w; seen[kind][i].rect[3] = h;
+        count[kind]++;
+        char at[96]; crash_addr_str(at, sizeof at, caller);
+        LOG("[geometry-diag] %s distinct=%u index=%d rect=%.9g,%.9g %.9gx%.9g caller=%s", kind == 0 ? "viewport" : kind == 1 ? "scissor" : "target-base", i + 1, index, x, y, w, h, at);
+        if (count[kind] == 256) LOG("[geometry-diag] category %d cap reached", kind);
+    }
+    pthread_mutex_unlock(&mu);
+    errno = saved_errno;
+}
+#endif
 NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NVNtexture *const *ct, const NVNtextureView *const *cv,
     const NVNtexture *dt, const NVNtextureView *dv) {
     if (n < 0 || n > 8) { LOG("[RED] SetRenderTargets count %d", n); n = n < 0 ? 0 : 8; }
     p_set_rt *r = REC_SNAP(c, OP_SET_RT, p_set_rt, n + 1); r->n = n;
     for (int i = 0; i < n; i++) { r->color[i] = ct ? tex_snap(r, SNAP_OFF(p_set_rt), i, ct[i], (uint64_t)__builtin_return_address(0)) : NULL; copy_view(&r->cview[i], &r->has_cview[i], cv ? cv[i] : NULL); }
     r->depth = tex_snap(r, SNAP_OFF(p_set_rt), n, dt, (uint64_t)__builtin_return_address(0)); copy_view(&r->dview, &r->has_dview, dv);
+#ifdef DM_DIAGNOSTICS
+    for (int i = 0; i <= n; i++) {
+        const tex_t *t = i == n ? r->depth : r->color[i];
+        if (t && t->magic == MAGIC('T', 'E', 'X', 0)) geometry_diag(2, i == n ? -1 : i, 0, 0, t->d.width, t->d.height, (uint64_t)__builtin_return_address(0));
+    }
+#endif
 }
 NVN(nvnCommandBufferClearColor, void, NVNcommandBuffer *c, int index, const float *rgba, int mask) {
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; memcpy(r->rgba, rgba, 16);
@@ -1086,8 +1116,16 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
     if (n < 0 || first + n > 16) { LOG("[RED] SetViewports first=%d n=%d", first, n); return; }
     p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
+#ifdef DM_DIAGNOSTICS
+    for (int i = 0; i < n; i++) geometry_diag(0, first + i, v[4*i], v[4*i+1], v[4*i+2], v[4*i+3], (uint64_t)__builtin_return_address(0));
+#endif
 }
-NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
+NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) {
+    *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h};
+#ifdef DM_DIAGNOSTICS
+    geometry_diag(1, 0, x, y, w, h, (uint64_t)__builtin_return_address(0));
+#endif
+}
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){(const prog_t *)p, stages};

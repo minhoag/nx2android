@@ -123,6 +123,16 @@ uint64_t compat_dispatch(int hook, int arg, uint64_t ret, uint64_t orig, uint64_
         if (arg < 0 || arg >= nhooks || hooks[arg].module != m || hooks[arg].offset != orig)
             die("mismatched compatibility hook gate");
         struct compat_hook *h = &hooks[arg]; uint64_t cb = atomic_load(&h->selected);
+#ifdef DM_DIAGNOSTICS
+        static _Atomic unsigned calls[COMPAT_MAX];
+        unsigned call = atomic_fetch_add(&calls[arg], 1);
+        if (call < 4) {
+            module_t *target = cb ? module_of((void *)cb) : h->module;
+            LOG("[compat-diag] hook %d call %u origin=%s+%#llx selected=%d target=%s+%#llx inline=%d",
+                arg, call + 1, m->name, (unsigned long long)orig, cb != 0, target->name,
+                (unsigned long long)((cb ? cb : h->trampoline) - (uint64_t)target->base), h->inlined);
+        }
+#endif
         if (!h->inlined) regs[16] = cb ? cb : h->trampoline;
         else if (cb) {
             uint64_t context[30]; memcpy(context, regs, sizeof context);
@@ -138,6 +148,15 @@ uint64_t compat_dispatch(int hook, int arg, uint64_t ret, uint64_t orig, uint64_
     for (int i = 0; i < noperations; i++)
         if (operations[i].module == m && operations[i].offset == orig && operations[i].kind == arg) found = 1;
     if (!found) die("mismatched compatibility operation gate");
+#ifdef DM_DIAGNOSTICS
+    static _Atomic unsigned operation_calls[COMPAT_MAX];
+    for (int i = 0; i < noperations; i++) {
+        if (operations[i].module != m || operations[i].offset != orig || operations[i].kind != arg) continue;
+        unsigned call = atomic_fetch_add(&operation_calls[i], 1);
+        if (call < 4) LOG("[compat-diag] operation %d call %u origin=%s+%#llx", arg, call + 1, m->name, (unsigned long long)orig);
+        break;
+    }
+#endif
     if (arg == 4) { regs[0] = guest_ns(); return regs[0]; }
     if (arg == 1) {
         for (int i = 0; i < nwrites; i++) {

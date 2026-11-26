@@ -28,6 +28,8 @@ def _parser():
     po.add_argument('--external-runtime', action='store_true',
                     help='rewritten modules and shaders stay in the data pack, not the APK: install with porter install (in-app import is bundled mode only)')
     po.add_argument('--fps60', action='store_true', help='60 fps: the profile\'s own frame-rate cap, else the community\'s FPSLocker-Warehouse config of the game\'s build, fetched from GitHub')
+    po.add_argument('--aspect-ratio', choices=('native', '21:9'), default='native', help='21:9 uses a 3440:1440 (43:18) patch and presentation; requires --aspect-patch')
+    po.add_argument('--aspect-patch', metavar='FILE', help='your matching ultrawide ZIP or .pchtxt; required with --aspect-ratio 21:9')
     po.add_argument('--touch', action='store_true',
                     help='a game played by touch: the on-screen gamepad starts hidden, so every touch but the menu button\'s goes to the game (the pause menu shows it again; '
                          'the first launch\'s default: the app keeps the player\'s own settings)')

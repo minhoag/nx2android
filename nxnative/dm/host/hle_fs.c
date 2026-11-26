@@ -317,6 +317,19 @@ static int root_path(const char *root, const char *rest, char *out, size_t n) {
     }
     return 1;
 }
+#ifdef DM_DIAG_RESOURCE_PATH
+static void resource_path_diag(const char *rest, const char *out, int overlay, int found) {
+    while (*rest == '/') rest++;
+    if (strcmp(rest, DM_DIAG_RESOURCE_PATH)) return;
+    static _Atomic unsigned calls;
+    unsigned call = atomic_fetch_add(&calls, 1);
+    if (call < 16) {
+        int saved_errno = errno;
+        LOG("[resource-diag] call %u path=%s source=%s found=%d resolved=%s", call + 1, rest, overlay ? "overlay" : "base", found, out);
+        errno = saved_errno;
+    }
+}
+#endif
 static int rom_overlay_path(const mount_t *m, const char *rest, char *out, size_t n) {
     char *roots = strdup(m->overlay);
     if (!roots) die("rom overlay path allocation failed");
@@ -324,10 +337,17 @@ static int rom_overlay_path(const mount_t *m, const char *rest, char *out, size_
     for (char *root = strtok_r(roots, ":", &save); root; root = strtok_r(NULL, ":", &save)) {
         char candidate[1024];
         if (root_path(root, rest, candidate, sizeof candidate) && !access(candidate, F_OK)) {
-            strlcpy(out, candidate, n); free(roots); return 1;
+            strlcpy(out, candidate, n);
+#ifdef DM_DIAG_RESOURCE_PATH
+            resource_path_diag(rest, out, 1, 1);
+#endif
+            free(roots); return 1;
         }
     }
     int found = root_path(m->dir, rest, out, n) && !access(out, F_OK);
+#ifdef DM_DIAG_RESOURCE_PATH
+    resource_path_diag(rest, found ? out : "", 0, found);
+#endif
     free(roots);
     if (found) return 1;
     errno = ENOENT; return 0;
