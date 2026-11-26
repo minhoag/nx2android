@@ -1,0 +1,24 @@
+build	main	421c5411b487eb4d049dd065fec9547773e8e598
+build	subsdk9	6e1f84dfc647a4647ba0bcb47c156592
+build	sdk	bb560bdfa85b4a97786ae2c3b7995df6
+hook	0	main	0x3b420	function	ff4301d1
+callback	0	subsdk9	0x8950
+hook	1	main	0x4c550	function	fd7bbea9
+callback	1	subsdk9	0x87e0
+hook	2	main	0x1781ce8	function	ffc300d1
+callback	2	subsdk9	0x8610
+hook	3	main	0x183b3e4	function	289ca852
+callback	3	subsdk9	0x8050
+hook	4	main	0x114e98c	function	fd7bbca9
+callback	4	subsdk9	0x8090
+hook	5	main	0x108370c	inline	1501092a
+callback	5	subsdk9	0x8040
+hook	6	main	0x1141ba0	inline	1f1c0072
+callback	6	subsdk9	0x8930
+callback	6	subsdk9	0x9370
+operation	subsdk9	0x6000	1
+operation	subsdk9	0x16a0	2
+operation	subsdk9	0x4020	3
+operation	subsdk9	0xa6a0	4
+write	subsdk9	0x28004	4	3
+base	subsdk9	0x2c0e0	main

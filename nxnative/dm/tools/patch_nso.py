@@ -19,8 +19,16 @@ from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
 import nso_asm
 from nso_asm import *   # the instruction encoders (B, ADRP, LDRX, ...), shared with the per-build patch files
 
+assert len(sys.argv) == 4 or len(sys.argv) == 6 and sys.argv[4] == '--compat', 'usage: patch_nso.py source output module [--compat manifest]'
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
+import nso_compat
+compat_sites, compat_runtime, compat_trampolines = [], '', []
 d = open(src, 'rb').read()
+if len(sys.argv) == 6:
+    assert os.environ.get('DM_TARGET', 'apple') == 'android', 'offline compatibility generation requires DM_TARGET=android'
+    compat_sites, compat_runtime = nso_compat.load(sys.argv[5], NAME, d[0x40:0x60].hex())
+else:
+    assert not os.path.exists(os.path.join(outdir, 'compat.tsv')) and not os.path.exists(os.path.join(outdir, NAME + '.compat.tsv')), 'compatibility output requires an explicit --compat manifest; use a clean output directory'
 if d[0x10:0x14] == b'NRO0':
     # An NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code): the file is the image itself, each segment stored at its memory offset
     # and uncompressed; +0x20 text, +0x28 ro, +0x30 data as {offset, size}, +0x38 bss size, +0x40 the build ID. Rewritten as an NSO of the same layout would be
@@ -856,6 +864,11 @@ if far_into:   # functions analysed in pieces (pieces above): their far b / bl, 
     for at, to in far_into: assert to not in win_mid and to not in rmid_all, f'far branch into a window or retry block {at:x}'
     for at, tgt in tabjumps.items(): assert not any(t in win_mid or t in rmid_all for t in tgt), f'jump table target into a window or retry block {at:x}'
 
+assert not compat_sites or BUILD_ID not in PATCHES['FRAME_STEP'], 'compatibility hooks with frame-step stubs are not supported'
+compat_blocked = set(kinds) | done | {off for off, oid, ow, why in PATCHES['OBS'].get(BUILD_ID, [])}
+compat_windows = list(DATA_BLOCKS) + [(seg[0].address, seg[-1].address + 4) for seg in windows]
+compat_windows += [(seg[0].address, end) for parts in retries for seg, end in parts]
+nso_compat.validate(compat_sites, IMG, TEXT_END, dis, compat_blocked, compat_windows)
 def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
 for wseg in windows:
     st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
@@ -938,6 +951,12 @@ if BUILD_ID in FRAME_STEP and NAME == 'main':
 if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py)
     fs = types.SimpleNamespace(here=here, emit=emit, site=fs_site, put=fs_put, state=FS_STATE_OFF, render_scale=0)
     FRAME_STEP[BUILD_ID](fs); RENDER_SCALE = fs.render_scale
+
+# Emit before spin analysis: no spin copy may retain an unhooked instruction.
+nso_compat.validate(compat_sites, IMG, TEXT_END, dis, compat_blocked, compat_windows)
+compat_trampolines = nso_compat.emit_hooks(compat_sites, here, emit, emit_gate_call, put_branch, gates)
+compat_origins = {off for off, ident, mode, expected in compat_sites}
+done.update(compat_origins)   # spin_touched includes all emitted compatibility sites
 
 # ---- Spin waits (every module) ----
 # A guest loop that polls memory until another thread changes it fills only its own core on the Switch, where any higher-priority thread pinned there preempts it, so the
@@ -1148,6 +1167,8 @@ def spin_emit(g):
         else: st = here(); emit(spin_rebranch(x, here(), cpy[T])); emit(B(here(), b + 4)); put_branch(b, st)
     stat('spin')
 spin_regions = [g for g in (spin_region(T, spin_cand[T]) for T in sorted(spin_cand)) if g]   # all found on the unchanged image first: emitting patches back-edges
+for g in spin_regions:
+    assert not any(x.address in {off for off, ident, mode, expected in compat_sites} for a in g['R'] for x in g['nodes'][a]['ins']), 'compatibility hook conflicts with spin copy'
 spin_sites = [(g['T'], sorted(g['valid']), sum(len(g['nodes'][a]['ins']) for a in g['R'])) for g in spin_regions]
 for g in spin_regions: spin_emit(g)
 if os.environ.get('DM_SPIN_LIST'):
@@ -1166,7 +1187,7 @@ else:
     open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
 import hashlib
 with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:   # the same for every module: the rewriter and every patch file, by path from dm/tools
-    for src_ in (os.path.abspath(__file__), nso_code.__file__, nso_asm.__file__, *PATCH_FILES): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
+    for src_ in (os.path.abspath(__file__), nso_code.__file__, nso_asm.__file__, nso_compat.__file__, *PATCH_FILES, *([sys.argv[5]] if compat_sites else [])): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
 with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
@@ -1177,6 +1198,10 @@ with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')   # the host identifies the build by it: features with hard-coded addresses only run on the build they belong to
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
+if compat_sites:
+    with open(P('compat.tsv'), 'w') as f:
+        for ident, offset in compat_trampolines: f.write(f'{ident}\t{offset:#x}\n')
+    with open(os.path.join(outdir, 'compat.tsv'), 'w') as f: f.write(compat_runtime)
 with open(P('sites.tsv'), 'w') as f:
     for a in sorted(kinds):
         if a not in done: f.write(f'{a:#x}\t{kinds[a][0]}\n')

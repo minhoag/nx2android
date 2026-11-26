@@ -1,0 +1,111 @@
+{
+  "opt_in": true,
+  "title_id": "0100A3D008C5C000",
+  "name": "Pokemon Compass",
+  "mod_version": null,
+  "mod_source": null,
+  "confirmation": "User reports the final UI scale, centering and camera work. Earlier branding regression was not independently diagnosed.",
+  "package": "org.nx2a.scarlet.compass",
+  "version_name": "4.0.0",
+  "version_code": 786433,
+  "game_version": "v786432",
+  "language": "en-US",
+  "dlc": [
+    1
+  ],
+  "ui": {
+    "width": 952.55810546875,
+    "height": 720,
+    "horizontal_offset": 163.720947265625,
+    "camera_multiplier": 1.34375,
+    "presentation_aspect": "43:18"
+  },
+  "env": {
+    "DM_LANG": "en-US",
+    "DM_FPS_TARGET": "0",
+    "DM_FPS_HOLD": "off",
+    "DM_VK_X_FLAT_VS": "45cd97ab0aae9cdc:8",
+    "DM_VK_DRIVER": "libvulkan_freedreno.so",
+    "DM_NVN_AHEAD": "1",
+    "DM_FPS_PIN": "60",
+    "DM_VK_CB_DRAWS": "240",
+    "DM_PRESENT_ASPECT": "43:18"
+  },
+  "settings": {
+    "overlay": 1,
+    "rumble": 1,
+    "docked": 0,
+    "fps": 1,
+    "sr": 1,
+    "sharpness": 0,
+    "opacity": 20,
+    "grid": 1,
+    "display_fill": 1,
+    "fps_rows": 31,
+    "fps_pos": 3,
+    "fps_colour": 0,
+    "fps_outline": 0,
+    "fps_size": 0,
+    "labels": 1
+  },
+  "settings_note": "Reference only; never overwrite user preferences. Device-specific ui placement omitted.",
+  "mods": {
+    "overlay_root": "usermods/<user-selected-mod>/romfs",
+    "overlay_index": {
+      "path": "arc/data.trpfd",
+      "sha256": "45dfd47d46d2ab842d6266d90acc51c953ac5d0baef115e35db137508ab62b3f"
+    },
+    "romfs_override": {
+      "path": "script/lua/bin/release/main/main.blua",
+      "sha256": "5f1d0888f90debe846d7f4baa9572e3a92c354def602ee91637bd74ad7510c8b"
+    },
+    "required": "User-supplied matching Compass auxiliary modules, script override and complete RomFS overlay; no mod assets included."
+  },
+  "verified_artifact": {
+    "apk_sha256": "b311faf985fe827293e1851377cfd0bfeb1fc328be6b56c5a479fd4c4644ff66",
+    "runtime_bundle": "1bf07f4c6bb14270973be59543accdeb2d35e819a48adf3b36eb6e8ec5a787fa",
+    "note": "Historical diagnostic build from dirty worktree, not a reproducible APK hash from this commit. No signing key or certificate requirement supplied."
+  },
+  "paired_runtime_files": [
+    {
+      "path": "mods/sdk.compat.tsv",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "path": "mods/sdk.fixups.tsv",
+      "sha256": "e0d09bb541d09a2655d96361bf5b35f20a457d44ac3d2c1ab800ab05b1d67ba1",
+      "size": 255
+    },
+    {
+      "path": "mods/sdk.gates.tsv",
+      "sha256": "8c2d298261197f151cc3a3c5e449623f66c41045fe296a9d22aac38e2e2549ac",
+      "size": 3192
+    },
+    {
+      "path": "mods/sdk.patched.bin",
+      "sha256": "8e7992d3b308a7bf6d7172b264a3b748bb05322696c2d40aa45bfd6fb03ebb3d",
+      "size": 14995620
+    },
+    {
+      "path": "mods/subsdk9.compat.tsv",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "path": "mods/subsdk9.fixups.tsv",
+      "sha256": "ad653b331c153ab00c4e2bfa3ec9cb83390d7d091d2d3bc18e429027da1fac79",
+      "size": 250
+    },
+    {
+      "path": "mods/subsdk9.gates.tsv",
+      "sha256": "46aca9bc840d20261e7d743d4647a4ab8db67a4f42e4bbee0705704c147c73c5",
+      "size": 424
+    },
+    {
+      "path": "mods/subsdk9.patched.bin",
+      "sha256": "1914e6eb422e08e4bacdb3e73e8ad5492e579ce69ab4569d5144e18d8ce201bd",
+      "size": 329792
+    }
+  ]
+}
